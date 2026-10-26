@@ -1,10 +1,11 @@
 import { SlashCommandBuilder } from "discord.js";
 
 export const commands = [
-  new SlashCommandBuilder().setName("agent").setDescription("Agentcordに日本語で依頼")
-    .addStringOption((o) => o.setName("指示").setDescription("ロールパネル作成・編集の依頼").setMaxLength(1500).setRequired(true))
-    .addStringOption((o) => o.setName("mode").setDescription("Agentcordの処理モード").addChoices({ name: "Mini", value: "mini" }, { name: "Max", value: "max" })),
+  new SlashCommandBuilder().setName("agent").setDescription("Agentcordに日本語でDiscord管理を依頼")
+    .addStringOption((o) => o.setName("指示").setDescription("パネル・権限なしロール・Text Channel作成の依頼").setMaxLength(1500).setRequired(true))
+    .addStringOption((o) => o.setName("mode").setDescription("Mini=単一パネル、Max=複数Skill workflow").addChoices({ name: "Mini", value: "mini" }, { name: "Max", value: "max" })),
   new SlashCommandBuilder().setName("autocord").setDescription("Autocord管理")
+    .addSubcommand((s) => s.setName("skills").setDescription("利用可能なAgentcord Skills一覧"))
     .addSubcommand((s) => s.setName("panels").setDescription("このサーバーのパネル一覧"))
     .addSubcommand((s) => s.setName("roles").setDescription("Autocord管理ロールの一覧"))
     .addSubcommand((s) => s.setName("channels").setDescription("発行可能なチャンネル一覧"))
@@ -13,6 +14,8 @@ export const commands = [
       .addIntegerOption((o) => o.setName("mini_monthly").setDescription("Miniの月間上限（サービス上限以下）").setMinValue(0).setMaxValue(1000))
       .addIntegerOption((o) => o.setName("max_monthly").setDescription("Maxの月間上限（サービス上限以下）").setMinValue(0).setMaxValue(1000)))
     .addSubcommand((s) => s.setName("history").setDescription("直近の操作履歴"))
+    .addSubcommand((s) => s.setName("status").setDescription("ジョブとSkill stepの状態を確認")
+      .addStringOption((o) => o.setName("job_id").setDescription("確認するジョブID").setRequired(true)))
     .addSubcommand((s) => s.setName("undo").setDescription("対応可能な直近変更を元に戻す").addStringOption((o) => o.setName("job_id").setDescription("元に戻す操作のジョブID").setRequired(true))),
   new SlashCommandBuilder().setName("giveaway").setDescription("配布企画を管理")
     .addSubcommand((s) => s.setName("create").setDescription("配布企画を開始")

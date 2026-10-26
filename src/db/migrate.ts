@@ -35,8 +35,18 @@ try {
     ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS execution_context jsonb;
     ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS approval_actor_id text;
     ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS decision_at timestamptz;
+    ALTER TABLE agent_jobs ADD COLUMN IF NOT EXISTS plan_hash_version integer NOT NULL DEFAULT 1;
     CREATE UNIQUE INDEX IF NOT EXISTS agent_jobs_idempotency_idx ON agent_jobs(guild_id, idempotency_key);
     CREATE INDEX IF NOT EXISTS agent_jobs_guild_state_idx ON agent_jobs(guild_id, state);
+    CREATE TABLE IF NOT EXISTS agent_job_steps (
+      id text PRIMARY KEY, job_id text NOT NULL, guild_id text NOT NULL, step_id text NOT NULL,
+      sequence integer NOT NULL, skill_id text NOT NULL, state text NOT NULL, input jsonb NOT NULL,
+      result jsonb, error_detail jsonb, attempts integer NOT NULL DEFAULT 0,
+      started_at timestamptz, completed_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(job_id, step_id)
+    );
+    CREATE INDEX IF NOT EXISTS agent_job_steps_job_sequence_idx ON agent_job_steps(job_id, sequence);
+    CREATE INDEX IF NOT EXISTS agent_job_steps_state_idx ON agent_job_steps(state);
     CREATE INDEX IF NOT EXISTS panels_guild_updated_idx ON panels(guild_id, updated_at);
     UPDATE panels AS p SET spec = jsonb_build_object(
       'intent', 'edit', 'panelId', p.id, 'expectedRevision', p.revision,
@@ -55,9 +65,15 @@ try {
       WHERE state = 'AWAITING_APPROVAL' AND coalesce(plan->>'selectionMode', '') = '';
     UPDATE agent_jobs SET state = 'RECOVERY_REQUIRED', error_detail = '{"reason":"legacy execution without lease"}'::jsonb, updated_at = now()
       WHERE state = 'EXECUTING' AND lease_owner IS NULL;
+    UPDATE agent_jobs SET state = 'EXPIRED', error_detail = '{"reason":"approval hash format upgraded; re-preview required"}'::jsonb, updated_at = now()
+      WHERE state = 'AWAITING_APPROVAL' AND plan_hash_version < 2;
     CREATE TABLE IF NOT EXISTS managed_roles (
       guild_id text NOT NULL, role_id text NOT NULL, owner_job_id text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(guild_id, role_id)
+    );
+    CREATE TABLE IF NOT EXISTS managed_channels (
+      guild_id text NOT NULL, channel_id text NOT NULL, owner_job_id text NOT NULL,
+      kind text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(guild_id, channel_id)
     );
     CREATE TABLE IF NOT EXISTS panel_revisions (
       id text PRIMARY KEY, panel_id text NOT NULL REFERENCES panels(id) ON DELETE CASCADE,

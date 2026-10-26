@@ -17,10 +17,28 @@ export const agentJobs = pgTable("agent_jobs", {
   instruction: text("instruction").notNull(),
   plan: jsonb("plan"),
   planHash: text("plan_hash"),
+  planHashVersion: integer("plan_hash_version").default(1).notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [uniqueIndex("agent_jobs_idempotency_idx").on(table.guildId, table.idempotencyKey), index("agent_jobs_guild_state_idx").on(table.guildId, table.state)]);
+
+export const agentJobSteps = pgTable("agent_job_steps", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull(),
+  guildId: text("guild_id").notNull(),
+  stepId: text("step_id").notNull(),
+  sequence: integer("sequence").notNull(),
+  skillId: text("skill_id").notNull(),
+  state: text("state").notNull(),
+  input: jsonb("input").notNull(),
+  result: jsonb("result"),
+  errorDetail: jsonb("error_detail"),
+  attempts: integer("attempts").default(0).notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("agent_job_steps_job_step_idx").on(table.jobId, table.stepId), index("agent_job_steps_job_sequence_idx").on(table.jobId, table.sequence), index("agent_job_steps_state_idx").on(table.state)]);
 
 export const panels = pgTable("panels", {
   id: text("id").primaryKey(),
@@ -60,6 +78,14 @@ export const managedRoles = pgTable("managed_roles", {
   ownerJobId: text("owner_job_id").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [primaryKey({ columns: [table.guildId, table.roleId] })]);
+
+export const managedChannels = pgTable("managed_channels", {
+  guildId: text("guild_id").notNull(),
+  channelId: text("channel_id").notNull(),
+  ownerJobId: text("owner_job_id").notNull(),
+  kind: text("kind").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [primaryKey({ columns: [table.guildId, table.channelId] })]);
 
 export const panelRevisions = pgTable("panel_revisions", {
   id: text("id").primaryKey(),
