@@ -10,7 +10,9 @@ const originalBackend = process.env.AI_BACKEND;
 const originalFallback = process.env.AI_FALLBACK_MODEL;
 
 function response(object: unknown) {
-  mocks.generateOpenCodePlan.mockResolvedValue({ object, model: "mock/max", inputTokens: 10, outputTokens: 10 });
+  mocks.generateOpenCodePlan
+    .mockResolvedValueOnce({ object: { target: "interactive", requiredActions: [], requiredTriggers: [], invariants: [] }, model: "mock/requirements", inputTokens: 5, outputTokens: 5 })
+    .mockResolvedValueOnce({ object, model: "mock/max", inputTokens: 10, outputTokens: 10 });
 }
 
 afterEach(() => {
@@ -22,6 +24,27 @@ afterEach(() => {
 });
 
 describe("Agentcord Max requirement routing and plan verification", () => {
+  it("fails closed on invalid structured requirement output", async () => {
+    process.env.AI_BACKEND = "opencode-server";
+    mocks.generateOpenCodePlan.mockResolvedValueOnce({ object: { target: "interactive" }, model: "mock/requirements", inputTokens: 3, outputTokens: 2 });
+    const plan = await makePlan("Build a custom workflow", undefined, "max");
+    expect(plan.interactiveWorkflow).toBeUndefined();
+    expect(plan.clarification?.missingSkills).toContain("agentcord.max.structured_requirements");
+    expect(mocks.generateOpenCodePlan).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a valid plan that omits a structured required action", async () => {
+    process.env.AI_BACKEND = "opencode-server";
+    const workflow = JSON.parse(readFileSync(new URL("../../examples/workflows/valorant-recruitment.json", import.meta.url), "utf8"));
+    mocks.generateOpenCodePlan
+      .mockResolvedValueOnce({ object: { target: "interactive", requiredActions: ["giveaway.create"], requiredTriggers: [], invariants: [] }, model: "mock/requirements", inputTokens: 4, outputTokens: 4 })
+      .mockResolvedValueOnce({ object: { target: "interactive", workflow }, model: "mock/max", inputTokens: 10, outputTokens: 10 })
+      .mockResolvedValueOnce({ object: { target: "interactive", workflow }, model: "mock/max", inputTokens: 2, outputTokens: 2 });
+    const result = await makePlan("Make a signup workflow", undefined, "max");
+    expect(result.interactiveWorkflow).toBeUndefined();
+    expect(result.clarification?.questions.join(" ")).toContain("giveaway.create");
+  });
+
   it("requires a Modal workflow with member persistence and owner-only notification for contact requests", async () => {
     process.env.AI_BACKEND = "opencode-server";
     response({ target: "interactive", workflow: {

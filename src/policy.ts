@@ -39,6 +39,7 @@ const interactiveActionSkills: Record<InteractiveWorkflowStep["action"], AgentSk
   "state.increment": "workflow.state.increment",
   "state.decrement": "workflow.state.decrement",
   "state.multiply": "workflow.state.multiply",
+  "state.debit": "workflow.state.debit",
   "state.delete": "workflow.state.delete",
   "state.reset": "workflow.state.reset",
   "state.append": "workflow.state.append",
@@ -60,16 +61,31 @@ const interactiveActionSkills: Record<InteractiveWorkflowStep["action"], AgentSk
   "collection.list": "workflow.collection.list",
   "collection.rank": "workflow.collection.rank",
   "collection.clear": "workflow.collection.clear",
+  "workflow.wait": "workflow.wait",
   "role.grant": "workflow.role.grant",
   "role.revoke": "workflow.role.revoke",
   "message.send": "workflow.message.send",
   "message.edit": "workflow.message.edit",
+  "message.reply": "workflow.message.reply",
+  "message.dm": "workflow.message.dm",
+  "message.delete": "workflow.message.delete",
+  "message.pin": "workflow.message.pin",
+  "message.unpin": "workflow.message.unpin",
   "panel.refresh": "workflow.panel.refresh",
   "voice.channel.create": "workflow.voice.channel.create",
   "voice.channel.delete": "workflow.voice.channel.delete",
   "resource.role.create": "workflow.resource.role.create",
   "resource.channel.create_category": "workflow.resource.channel.create_category",
   "resource.channel.create_text": "workflow.resource.channel.create_text",
+  "channel.create_voice": "workflow.channel.create_voice",
+  "channel.create_text": "workflow.channel.create_text",
+  "channel.rename": "workflow.channel.rename",
+  "channel.delete": "workflow.channel.delete",
+  "channel.set_permission": "workflow.channel.set_permission",
+  "channel.move_member": "workflow.channel.move_member",
+  "channel.get_members": "workflow.channel.get_members",
+  "role.rename": "workflow.role.rename",
+  "role.member_count": "workflow.role.member_count",
   "giveaway.create": "workflow.giveaway.create",
   "giveaway.join": "workflow.giveaway.join",
   "giveaway.leave": "workflow.giveaway.leave",
@@ -85,6 +101,8 @@ export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: Int
   const bot = guild.members.me;
   if (!bot) throw new Error("Bot guild member could not be resolved.");
   for (const trigger of workflow.triggers) {
+    if (trigger.event.startsWith("member.") && process.env.ENABLE_GUILD_MEMBERS_INTENT !== "true") throw new Error("Member lifecycle triggers require ENABLE_GUILD_MEMBERS_INTENT=true and the privileged Guild Members intent enabled in the Discord application.");
+    if ((trigger.event === "message.created" || trigger.event === "reaction.added" || trigger.event === "reaction.removed") && process.env.ENABLE_MESSAGE_CONTENT_INTENT !== "true" && trigger.steps.some((step) => Object.values(step).some((value) => typeof value === "string" && /\{\{input:content\}\}/.test(value)))) throw new Error("Reading message content requires ENABLE_MESSAGE_CONTENT_INTENT=true and the privileged Message Content intent enabled in the Discord application.");
     if (trigger.event === "voice.member_join_event") assertSkillPermissions("workflow.voice.member_join_event", actor);
     if (trigger.event === "voice.member_leave_event") assertSkillPermissions("workflow.voice.member_leave_event", actor);
     for (const step of trigger.steps) {
@@ -93,7 +111,7 @@ export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: Int
       if (step.action === "role.grant" || step.action === "role.revoke") {
         if (!bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for this Workflow.");
       }
-      if (step.action === "message.send" || step.action === "message.edit" || step.action === "panel.refresh") {
+      if (step.action === "message.send" || step.action === "message.edit" || step.action === "message.reply" || step.action === "panel.refresh") {
         if (!bot.permissions.has(PermissionFlagsBits.SendMessages)) throw new Error("Bot needs Send Messages for this Workflow.");
       }
       if (step.action === "voice.channel.create" || step.action === "voice.channel.delete") {
@@ -102,6 +120,11 @@ export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: Int
       }
       if (step.action === "resource.role.create" && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for Workflow role creation.");
       if ((step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text") && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for Workflow channel creation.");
+      if (["channel.create_voice", "channel.rename", "channel.delete", "channel.set_permission"].includes(step.action) && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for this Workflow action.");
+      if (step.action === "channel.create_text" && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for channel.create_text.");
+      if (step.action === "channel.move_member" && !bot.permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error("Bot needs Move Members for this Workflow action.");
+      if (step.action === "role.rename" && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for this Workflow action.");
+      if (step.action === "role.member_count" && process.env.ENABLE_GUILD_MEMBERS_INTENT !== "true") throw new Error("role.member_count requires the privileged Guild Members intent.");
     }
   }
 }

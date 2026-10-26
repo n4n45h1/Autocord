@@ -1,12 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { MessageFlags } from "discord.js";
+import { MessageFlags, PermissionFlagsBits } from "discord.js";
 import { compileInteractiveWorkflow, interactiveWorkflowSchema, interactiveWorkflowStepSchema, workflowConditionSchema, orderInteractiveWorkflowSteps, type WorkflowCondition } from "../../agent/interactive-workflow.js";
 import { agentSkills } from "../../agent/skills/registry.js";
 import { analyzeRequestRequirements, validatePlanTargetAgainstRequest, validateWorkflowAgainstRequest } from "../../agent/requirements.js";
 import { evaluateWorkflowCondition, renderWorkflowTemplate } from "./conditions.js";
 import { renderInteractiveWorkflow } from "./render.js";
 import { calculateAggregateMath, calculateBinaryMath, calculateClamp, selectWeighted } from "./math.js";
+import { nextWeeklyOccurrence } from "./schedule.js";
+import { buildWorkflowPrivateOverwrites, mayCloseWorkflowChannel } from "./permissions.js";
 
 const signup = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/valorant-recruitment.json", import.meta.url), "utf8")));
 const onboarding = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/onboarding-consent.json", import.meta.url), "utf8")));
@@ -53,11 +55,7 @@ describe("generic interactive Workflow definitions", () => {
 
   it("keeps requested scenarios A-F distinct from currently executable primitives", () => {
     const scenarios = [
-      ["A", "ユーザーがイベントに参加すると100ポイント付与。500ポイントで景品交換できるようにして", "workflow.atomic_conditional_debit_and_redemption"],
       ["B", "戦士・魔法使い・僧侶が選べるRPG。HP、攻撃力、経験値、レベル、ゴールド、戦闘とショップ", "workflow.turn_based_game_loop_and_transactional_shop"],
-      ["C", "問い合わせボタンからフォームを開き、スタッフだけが確認できる専用チャンネルを作って", "channel.private_ticket_permission_preset_and_close_lifecycle"],
-      ["E", "提案に賛成が20票集まったら管理者に通知して。1人1票まで", "trigger.reaction_added_and_atomic_unique_vote_threshold"],
-      ["F", "毎週土曜日にイベントを開催し、終了後にランキングをリセット", "schedule.at_timezone_and_weekly_calendar_trigger"],
     ] as const;
     for (const [name, request, missingSkill] of scenarios) {
       expect(analyzeRequestRequirements(request).unsupportedSkills, `scenario ${name}`).toContain(missingSkill);
@@ -68,6 +66,136 @@ describe("generic interactive Workflow definitions", () => {
     expect(voiceLobby.unsupportedSkills).not.toContain("workflow.button_signup_to_voice_session_membership");
     const buttonSignup = analyzeRequestRequirements("参加ボタンで5人集まったら専用VCを作成して");
     expect(buttonSignup.unsupportedSkills).toContain("workflow.button_signup_to_voice_session_membership");
+    const underspecifiedWeekly = analyzeRequestRequirements("毎週土曜日にイベントを開催し、終了後にランキングをリセット");
+    expect(underspecifiedWeekly.missingInformation).toContain("毎週イベントを実行する時刻 (例: 18:00)");
+    expect(underspecifiedWeekly.missingInformation).toContain("毎週イベントのIANAタイムゾーン (例: Asia/Tokyo)");
+    expect(underspecifiedWeekly.missingInformation).toContain("イベントの開催時間/終了時刻 (ランキングをリセットする遅延時間)");
+    expect(analyzeRequestRequirements("毎週土曜日18:00 Asia/Tokyoにイベントを開催").missingInformation).toEqual([]);
+  });
+
+  it("calculates persistent weekly calendar occurrences in the requested IANA zone", () => {
+    const now = new Date("2026-10-26T12:00:00.000Z");
+    expect(nextWeeklyOccurrence(now, 6, 18, 0, "Asia/Tokyo").toISOString()).toBe("2026-10-31T09:00:00.000Z");
+    expect(() => nextWeeklyOccurrence(now, 6, 18, 0, "Not/AZone")).toThrow();
+    const recurring = compileInteractiveWorkflow({
+      version: 1, name: "Saturday event", title: "Weekly", description: "", color: "blue", components: [],
+      triggers: [{ id: "saturday", event: "schedule.at", dayOfWeek: 6, hour: 18, minute: 0, timeZone: "Asia/Tokyo", steps: [
+        { id: "wait", action: "workflow.wait", seconds: 3600 },
+        { id: "reset", action: "state.reset", scope: "guild", key: null, dependsOn: ["wait"] },
+      ] }],
+    });
+    expect(recurring.triggers[0]?.event).toBe("schedule.at");
+    expect(recurring.triggers[0]?.steps.some((step) => step.action === "panel.refresh")).toBe(true);
+  });
+
+  it("limits private ticket overwrites to visibility and basic message permissions", () => {
+    const staff = buildWorkflowPrivateOverwrites({ guildId: "guild", botId: "bot", preset: "staff_only", staffRoleId: "staff" });
+    expect(staff[0]).toEqual({ id: "guild", deny: [PermissionFlagsBits.ViewChannel] });
+    expect(staff.map((overwrite) => overwrite.id)).toEqual(["guild", "bot", "staff"]);
+    const allowed = PermissionFlagsBits.ViewChannel | PermissionFlagsBits.SendMessages | PermissionFlagsBits.ReadMessageHistory;
+    for (const overwrite of staff.slice(1)) {
+      const permission = overwrite.allow?.reduce((bits, flag) => bits | flag, 0n) ?? 0n;
+      expect(permission & ~allowed).toBe(0n);
+    }
+    expect(() => buildWorkflowPrivateOverwrites({ guildId: "guild", botId: "bot", preset: "staff_only", staffRoleId: "guild" })).toThrow();
+    expect(mayCloseWorkflowChannel({ createdForMemberId: "owner", staffRoleId: "staff", memberId: "owner", memberRoleIds: new Set(), isGuildManager: false })).toBe(true);
+    expect(mayCloseWorkflowChannel({ createdForMemberId: "owner", staffRoleId: "staff", memberId: "staff-user", memberRoleIds: new Set(["staff"]), isGuildManager: false })).toBe(true);
+    expect(mayCloseWorkflowChannel({ createdForMemberId: "owner", staffRoleId: "staff", memberId: "stranger", memberRoleIds: new Set(), isGuildManager: false })).toBe(false);
+  });
+
+  it("plans unique join awards and thresholded point redemption with an atomic debit", () => {
+    const request = "ユーザーがイベントに参加すると100ポイント付与。500ポイントで景品交換できるようにして";
+    const pointsWorkflow = compileInteractiveWorkflow({
+      version: 1, name: "Points and redemption", title: "Event points", description: "Join once; redeem for a prize.", color: "green",
+      components: [
+        { key: "join", kind: "button", label: "参加", style: "success", emoji: null, disabledWhen: { op: "entries.gte", collection: "participants", value: 100 }, triggerId: "join-trigger" },
+        { key: "redeem", kind: "button", label: "500ptで交換", style: "primary", emoji: null, triggerId: "redeem-trigger" },
+      ],
+      triggers: [
+        { id: "join-trigger", event: "button", componentKey: "join", steps: [
+          { id: "join", action: "entry.join", collection: "participants", maxEntries: 100 },
+          { id: "award", action: "state.increment", scope: "member", key: "points", amount: 100, dependsOn: ["join"], when: { op: "result.equals", stepId: "join", field: "joined", value: true } },
+        ] },
+        { id: "redeem-trigger", event: "button", componentKey: "redeem", steps: [
+          { id: "debit", action: "state.debit", scope: "member", key: "points", amount: 500, minimumBalance: 500 },
+          { id: "reward", action: "message.dm", recipient: "trigger_member", content: "景品交換が完了しました。", dependsOn: ["debit"], when: { op: "result.equals", stepId: "debit", field: "debited", value: true } },
+        ] },
+      ],
+    });
+    expect(analyzeRequestRequirements(request).pointsRequested).toBe(true);
+    expect(analyzeRequestRequirements(request).unsupportedSkills).toEqual([]);
+    expect(validateWorkflowAgainstRequest(request, pointsWorkflow)).toEqual([]);
+    expect(pointsWorkflow.triggers[1]?.steps.map((step) => step.action)).toContain("state.debit");
+  });
+
+  it("keeps inquiry input in a staff-only ticket channel and permits owner/staff closure", () => {
+    const request = "問い合わせボタンからフォームを開き、回答するとスタッフだけが確認できる専用チャンネルを作って。解決したら閉じられるようにして";
+    const ticketWorkflow = compileInteractiveWorkflow({
+      version: 1, name: "Private support ticket", title: "Support", description: "Submit an inquiry privately.", color: "blue",
+      components: [
+        { key: "form", kind: "modal", label: "問い合わせ", title: "お問い合わせ", triggerId: "submit-ticket", inputs: [{ key: "issue", label: "内容", placeholder: null, style: "paragraph", required: true, maxLength: 1000 }] },
+        { key: "close", kind: "modal", label: "チケットを閉じる", title: "Close ticket", triggerId: "close-ticket", inputs: [{ key: "ticket_id", label: "Ticket Channel ID", placeholder: null, style: "short", required: true, maxLength: 20 }] },
+        { key: "close-own", kind: "button", label: "自分のticketを閉じる", style: "danger", emoji: null, triggerId: "close-own-ticket" },
+      ],
+      triggers: [
+        { id: "submit-ticket", event: "modal_submit", componentKey: "form", steps: [
+          { id: "create-ticket", action: "channel.create_text", name: "ticket-{{actor}}", topic: null, visibility: "staff_only", staffRoleId: "12345678901234567" },
+          { id: "save-ticket", action: "state.set", scope: "member", key: "ticket_channel_id", value: "{{result:create-ticket:channelId}}", dependsOn: ["create-ticket"] },
+          { id: "send-inquiry", action: "message.send", delivery: "workflow_channel_step", channelStepId: "create-ticket", content: "{{input:issue}}", dependsOn: ["create-ticket"] },
+        ] },
+        { id: "close-ticket", event: "modal_submit", componentKey: "close", steps: [
+          { id: "delete-ticket", action: "channel.delete", channelStepId: null, channelId: "{{input:ticket_id}}", when: { op: "member.has_role", roleName: "Support" } },
+        ] },
+        { id: "close-own-ticket", event: "button", componentKey: "close-own", steps: [
+          { id: "delete-own-ticket", action: "channel.delete", channelStepId: null, channelId: "{{state:member:ticket_channel_id}}", when: { op: "state.exists", scope: "member", key: "ticket_channel_id" } },
+          { id: "clear-ticket-state", action: "state.delete", scope: "member", key: "ticket_channel_id", dependsOn: ["delete-own-ticket"] },
+        ] },
+      ],
+    });
+    expect(analyzeRequestRequirements(request).privateTicketRequested).toBe(true);
+    expect(analyzeRequestRequirements(request).unsupportedSkills).toEqual([]);
+    expect(validateWorkflowAgainstRequest(request, ticketWorkflow)).toEqual([]);
+  });
+
+  it("validates per-message unique reaction votes and notifies only at the threshold", () => {
+    const request = "提案に賛成が20票集まったら管理者に通知して。1人1票まで";
+    const voteWorkflow = compileInteractiveWorkflow({
+      version: 1, name: "Proposal vote", title: "Proposal", description: "React to vote.", color: "blue",
+      components: [{ key: "post", kind: "button", label: "Post proposal", style: "primary", emoji: null, triggerId: "proposal" }],
+      triggers: [
+        { id: "proposal", event: "button", componentKey: "post", steps: [{ id: "post-proposal", action: "message.send", delivery: "workflow_channel", content: "Proposal of the week" }] },
+        { id: "votes", event: "reaction.added", channelId: "workflow_channel", messageStepId: "post-proposal", emoji: "👍", steps: [
+          { id: "register-vote", action: "collection.add", scope: "workflow", collection: "votes", partitionByMessage: true, item: "{{input:authorId}}", maxItems: 1000 },
+          { id: "count-votes", action: "collection.count", scope: "workflow", collection: "votes", partitionByMessage: true, dependsOn: ["register-vote"] },
+          { id: "notify-owner", action: "message.send", delivery: "workflow_owner_dm", content: "Proposal received 20 votes.", dependsOn: ["count-votes"], when: { op: "and", conditions: [
+            { op: "result.equals", stepId: "register-vote", field: "added", value: true },
+            { op: "result.equals", stepId: "count-votes", field: "count", value: 20 },
+          ] } },
+        ] },
+      ],
+    });
+    expect(analyzeRequestRequirements(request).voteRequested).toBe(true);
+    expect(analyzeRequestRequirements(request).unsupportedSkills).toEqual([]);
+    expect(validateWorkflowAgainstRequest(request, voteWorkflow)).toEqual([]);
+  });
+
+  it("validates scoped gateway event triggers and Workflow-owned message targets", () => {
+    const gateway = interactiveWorkflowSchema.parse({
+      version: 1, name: "Message automation", title: "Messages", description: "", color: "blue", components: [],
+      triggers: [{ id: "message-trigger", event: "message.created", channelId: "12345678901234567", steps: [
+        { id: "reply", action: "message.reply", content: "Received {{input:content}}" },
+        { id: "edit-reply", action: "message.edit", targetStepId: "reply", content: "Handled", dependsOn: ["reply"] },
+      ] }],
+    });
+    expect(gateway.triggers[0]?.event).toBe("message.created");
+    expect(interactiveWorkflowSchema.safeParse({
+      ...gateway,
+      triggers: [{ id: "bad-reply", event: "member.join", steps: [{ id: "reply", action: "message.reply", content: "reply" }] }],
+    }).success).toBe(false);
+    expect(interactiveWorkflowSchema.safeParse({
+      ...gateway,
+      triggers: [{ id: "bad-resource", event: "reaction.added", channelId: "12345678901234567", emoji: null, steps: [{ id: "create", action: "channel.create_voice", name: "unsafe" }] }],
+    }).success).toBe(false);
   });
 
   it("accepts the recruitment UI/actions without feature-specific schema branches", () => {
@@ -160,7 +288,7 @@ describe("generic interactive Workflow definitions", () => {
     const withResult = structuredClone(signup);
     withResult.triggers[0]!.steps = [
       { id: "register", dependsOn: [], action: "entry.join", collection: "participants", maxEntries: 5 },
-      { id: "notify", dependsOn: ["register"], action: "message.send", delivery: "workflow_channel", content: "Count {{result:register:count}}" },
+      { id: "notify", dependsOn: ["register"], action: "message.send", delivery: "workflow_channel", channelStepId: null, content: "Count {{result:register:count}}" },
       { id: "refresh", dependsOn: ["register"], action: "panel.refresh" },
     ];
     expect(interactiveWorkflowSchema.safeParse(withResult).success).toBe(true);

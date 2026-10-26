@@ -6,10 +6,20 @@ import { interactiveWorkflowSchema, interactiveWorkflowStepSchema, interactiveWo
 const emptyInput = z.object({}).strict();
 const idInput = z.object({ id: z.string().min(1).max(80) }).strict();
 const giveawayIdInput = z.object({ giveawayId: z.string().min(1).max(80) }).strict();
+const workflowControlInput = z.object({ workflowId: z.string().min(1).max(80) }).strict();
+const workflowControlSkill = (action: string) => ({
+  inputSchema: workflowControlInput, requiredPermissions: ["ManageGuild"] as const, targetScope: "authenticated-guild-workflow", risk: "guild-state-write",
+  approval: { required: false, binds: ["guildId", "workflowId", "currentState"] }, effects: [`workflow.${action}`],
+});
 const workflowActionSkill = (action: string) => ({
   inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === action, `${action} action required`),
   requiredPermissions: [] as const, targetScope: "authenticated-workflow-and-declared-scope", risk: "workflow-state-write",
   approval: { required: false, binds: ["guildId", "workflowId", "stepId"] }, effects: [action],
+});
+const workflowTriggerSkill = (event: string) => ({
+  inputSchema: interactiveWorkflowTriggerSchema.refine((trigger) => trigger.event === event, `${event} trigger required`),
+  requiredPermissions: ["ManageGuild"] as const, targetScope: "authenticated-guild-event-trigger", risk: "guild-event-subscription",
+  approval: { required: false, binds: ["guildId", "workflowId", "triggerId"] }, effects: [`workflow.${event}.register`],
 });
 
 export const agentSkills = {
@@ -70,6 +80,10 @@ export const agentSkills = {
     requiredPermissions: ["ManageGuild"], targetScope: "authenticated-guild-and-workflow-version", risk: "guild-state-write",
     approval: { required: true, binds: ["guildId", "workflowId", "expectedVersion", "workflowHash", "expiresAt"] }, effects: ["workflow.definition.update", "workflow.message.edit"],
   },
+  "workflow.pause": workflowControlSkill("pause"),
+  "workflow.resume": workflowControlSkill("resume"),
+  "workflow.disable": workflowControlSkill("disable"),
+  "workflow.delete": workflowControlSkill("delete"),
   "workflow.list": {
     inputSchema: emptyInput,
     requiredPermissions: ["ManageGuild"], targetScope: "authenticated-guild", risk: "read-only",
@@ -94,6 +108,7 @@ export const agentSkills = {
   "workflow.state.increment": workflowActionSkill("state.increment"),
   "workflow.state.decrement": workflowActionSkill("state.decrement"),
   "workflow.state.multiply": workflowActionSkill("state.multiply"),
+  "workflow.state.debit": workflowActionSkill("state.debit"),
   "workflow.state.delete": workflowActionSkill("state.delete"),
   "workflow.state.reset": workflowActionSkill("state.reset"),
   "workflow.state.append": workflowActionSkill("state.append"),
@@ -115,6 +130,7 @@ export const agentSkills = {
   "workflow.collection.list": workflowActionSkill("collection.list"),
   "workflow.collection.rank": workflowActionSkill("collection.rank"),
   "workflow.collection.clear": workflowActionSkill("collection.clear"),
+  "workflow.wait": workflowActionSkill("workflow.wait"),
   "workflow.role.grant": {
     inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "role.grant", "workflow.role.grant requires role.grant"),
     requiredPermissions: [], targetScope: "interaction-member-and-owned-permissionless-role", risk: "member-self-role-change",
@@ -130,6 +146,11 @@ export const agentSkills = {
     requiredPermissions: [], targetScope: "workflow-owned-channel", risk: "guild-message-write",
     approval: { required: false, binds: ["workflowId", "channelId", "stepId"] }, effects: ["message.send-without-mentions"],
   },
+  "workflow.message.reply": workflowActionSkill("message.reply"),
+  "workflow.message.dm": workflowActionSkill("message.dm"),
+  "workflow.message.delete": workflowActionSkill("message.delete"),
+  "workflow.message.pin": workflowActionSkill("message.pin"),
+  "workflow.message.unpin": workflowActionSkill("message.unpin"),
   "workflow.message.edit": {
     inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "message.edit", "workflow.message.edit requires message.edit"),
     requiredPermissions: [], targetScope: "workflow-owned-panel-message", risk: "guild-message-write",
@@ -150,6 +171,14 @@ export const agentSkills = {
     requiredPermissions: ["ManageGuild"], targetScope: "workflow-managed-voice-channel", risk: "voice-state-event",
     approval: { required: false, binds: ["guildId", "workflowId", "managedVoiceSession"] }, effects: ["voice-state.leave-trigger.register"],
   },
+  "workflow.member.join": workflowTriggerSkill("member.join"),
+  "workflow.member.leave": workflowTriggerSkill("member.leave"),
+  "workflow.member.role_added": workflowTriggerSkill("member.role_added"),
+  "workflow.member.role_removed": workflowTriggerSkill("member.role_removed"),
+  "workflow.message.created": workflowTriggerSkill("message.created"),
+  "workflow.message.deleted": workflowTriggerSkill("message.deleted"),
+  "workflow.reaction.added": workflowTriggerSkill("reaction.added"),
+  "workflow.reaction.removed": workflowTriggerSkill("reaction.removed"),
   "workflow.voice.channel.create": {
     inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "voice.channel.create", "voice.channel.create action required"),
     requiredPermissions: ["ManageGuild"], targetScope: "guild-and-approved-source-voice-channel", risk: "guild-resource-create-and-member-move",
@@ -175,6 +204,15 @@ export const agentSkills = {
     requiredPermissions: ["ManageGuild", "ManageChannels"], targetScope: "manager-component-trigger-and-authenticated-guild", risk: "guild-resource-create",
     approval: { required: false, binds: ["guildId", "workflowId", "stepId", "categoryStepId"] }, effects: ["default-permission-text-channel.create-and-register-owned"],
   },
+  "workflow.channel.create_voice": workflowActionSkill("channel.create_voice"),
+  "workflow.channel.create_text": workflowActionSkill("channel.create_text"),
+  "workflow.channel.rename": workflowActionSkill("channel.rename"),
+  "workflow.channel.delete": workflowActionSkill("channel.delete"),
+  "workflow.channel.set_permission": workflowActionSkill("channel.set_permission"),
+  "workflow.channel.move_member": workflowActionSkill("channel.move_member"),
+  "workflow.channel.get_members": workflowActionSkill("channel.get_members"),
+  "workflow.role.rename": workflowActionSkill("role.rename"),
+  "workflow.role.member_count": workflowActionSkill("role.member_count"),
   "workflow.giveaway.create": {
     inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.create", "Workflow giveaway.create action required"),
     requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "admin-trigger-and-workflow-channel", risk: "guild-resource-create",

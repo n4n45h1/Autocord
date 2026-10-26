@@ -3,7 +3,7 @@ import { randomInt, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Events,
-  ChannelType, GatewayIntentBits, ModalBuilder, PermissionFlagsBits, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
+  ChannelType, GatewayIntentBits, ModalBuilder, Partials, PermissionFlagsBits, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
   type ChatInputCommandInteraction, type GuildMember, type InteractionReplyOptions, type MessageCreateOptions, type ModalSubmitInteraction, type Role,
 } from "discord.js";
 import { and, eq, gt, ilike, inArray, lte, or, sql } from "drizzle-orm";
@@ -20,17 +20,26 @@ import { commands } from "./discord/commands.js";
 import { drawWinners, giveawayNotificationRetryDelayMs, giveawayResultMessage } from "./features/giveaways/draw.js";
 import { renderPanel } from "./features/panels/render.js";
 import { listAgentSkills, parseResourceWorkflowInput, parseSkillInput, resolvePanelSkill, resolveResourceSkill, type AgentSkillId } from "./agent/skills/registry.js";
-import { compileInteractiveWorkflow, interactiveWorkflowSchema, type InteractiveWorkflow, type InteractiveWorkflowStep } from "./agent/interactive-workflow.js";
+import { compileInteractiveWorkflow, interactiveWorkflowSchema, type InteractiveWorkflow, type InteractiveWorkflowStep, type WorkflowCondition } from "./agent/interactive-workflow.js";
 import { analyzeRequestRequirements, validatePlanTargetAgainstRequest, validateWorkflowAgainstRequest } from "./agent/requirements.js";
-import { cleanupEmptyWorkflowVoiceChannels, dispatchWorkflowSchedules, handleInteractiveWorkflowInteraction, handleWorkflowVoiceStateUpdate, publishInteractiveWorkflow, recoverStaleInteractiveRuns, updateInteractiveWorkflow } from "./features/workflows/engine.js";
+import { cleanupEmptyWorkflowVoiceChannels, controlInteractiveWorkflow, dispatchWorkflowSchedules, dispatchWorkflowWaits, handleInteractiveWorkflowInteraction, handleWorkflowMemberJoin, handleWorkflowMemberLeave, handleWorkflowMemberRoleUpdate, handleWorkflowMessageCreate, handleWorkflowMessageDelete, handleWorkflowReactionAdd, handleWorkflowReactionRemove, handleWorkflowVoiceStateUpdate, publishInteractiveWorkflow, recoverStaleInteractiveRuns, suppressWorkflowRoleEvent, updateInteractiveWorkflow } from "./features/workflows/engine.js";
 import { renderInteractiveWorkflow } from "./features/workflows/render.js";
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+const gatewayIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions];
+if (process.env.ENABLE_GUILD_MEMBERS_INTENT === "true") gatewayIntents.push(GatewayIntentBits.GuildMembers);
+if (process.env.ENABLE_MESSAGE_CONTENT_INTENT === "true") gatewayIntents.push(GatewayIntentBits.MessageContent);
+const client = new Client({ intents: gatewayIntents, partials: [Partials.Channel, Partials.Message, Partials.Reaction, Partials.User] });
 const workerId = randomUUID();
 const adminPerms = [PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles];
 
 function requireAdmin(member: GuildMember): void {
   if (!adminPerms.every((permission) => member.permissions.has(permission))) throw new Error("サーバー管理とロール管理の権限が必要です。");
+}
+
+async function changeMemberRole(member: GuildMember, role: Role, grant: boolean, reason: string): Promise<void> {
+  suppressWorkflowRoleEvent(member.guild.id, member.id, role.id, grant ? "added" : "removed");
+  if (grant) await member.roles.add(role, reason);
+  else await member.roles.remove(role, reason);
 }
 
 function displaySendableChannel(channel: unknown): string | null {
@@ -74,6 +83,13 @@ function resourceStepSummary(step: ResourceWorkflowStep): string {
   }
 }
 
+function hasMemberRoleGuard(condition: WorkflowCondition | undefined, roleName: string): boolean {
+  if (!condition) return false;
+  if (condition.op === "not") return hasMemberRoleGuard(condition.condition, roleName);
+  if (condition.op === "and" || condition.op === "or") return condition.conditions.some((nested) => hasMemberRoleGuard(nested, roleName));
+  return condition.op === "member.has_role" && condition.roleName === roleName;
+}
+
 async function assertWorkflowManagedRoles(guildId: string, guild: import("discord.js").Guild, workflow: InteractiveWorkflow): Promise<void> {
   const roleNames = new Set(workflow.triggers.flatMap((trigger) => trigger.steps)
     .filter((step) => step.action === "role.grant" || step.action === "role.revoke").map((step) => step.roleName));
@@ -94,6 +110,12 @@ async function assertWorkflowManagedRoles(guildId: string, guild: import("discor
     }
     const createsInWorkflow = workflow.triggers.some((trigger) => trigger.steps.some((step) => step.action === "resource.role.create" && step.name === roleName));
     if (!createsInWorkflow) throw new Error(`Role ${roleName} must already be Autocord-managed or be created by a resource.role.create step in this Workflow.`);
+  }
+  const closeTicketSteps = workflow.triggers.flatMap((trigger) => trigger.event === "modal_submit" ? trigger.steps : []).filter((step) => step.action === "channel.delete" && typeof step.channelId === "string" && step.channelId.includes("{{input:"));
+  for (const step of workflow.triggers.flatMap((trigger) => trigger.steps).filter((item): item is Extract<InteractiveWorkflowStep, { action: "channel.create_text" }> => item.action === "channel.create_text" && item.visibility === "staff_only")) {
+    const role = step.staffRoleId ? guild.roles.cache.get(step.staffRoleId) ?? await guild.roles.fetch(step.staffRoleId).catch(() => null) : null;
+    if (!role || role.id === guild.id || role.managed) throw new Error("staff_only ticket channel requires an existing non-managed Guild staff role.");
+    if (closeTicketSteps.length && !closeTicketSteps.some((close) => hasMemberRoleGuard(close.when, role.name))) throw new Error("The ticket close modal must guard against the exact configured staff role.");
   }
 }
 
@@ -141,7 +163,10 @@ function interactiveWorkflowSummary(workflow: InteractiveWorkflow): string {
     return `button:${component.key} ${component.label} [${component.style}]`;
   }).join("; ");
   const triggerSummary = workflow.triggers.map((trigger) => {
-    const timing = trigger.event === "schedule" ? ` every ${trigger.intervalSeconds}s` : trigger.event === "deadline" ? ` after ${trigger.afterSeconds}s` : "";
+    const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const timing = trigger.event === "schedule" ? ` every ${trigger.intervalSeconds}s`
+      : trigger.event === "schedule.at" ? ` every ${weekdays[trigger.dayOfWeek]} ${String(trigger.hour).padStart(2, "0")}:${String(trigger.minute).padStart(2, "0")} ${trigger.timeZone}`
+        : trigger.event === "deadline" ? ` after ${trigger.afterSeconds}s` : "";
     const voiceSource = "voiceChannelId" in trigger ? ` sourceVoice=${trigger.voiceChannelId}` : "";
     const steps = trigger.steps.map((step) => `${step.id}: ${effect(step)}${step.dependsOn.length ? ` after[${step.dependsOn.join(",")}]` : ""}${step.when ? ` when ${JSON.stringify(step.when)}` : ""}`).join(" → ");
     return `• ${trigger.event}${"componentKey" in trigger ? `(${trigger.componentKey})` : ""}${voiceSource}${timing}: ${steps}`;
@@ -723,16 +748,16 @@ async function handlePanelComponent(interaction: import("discord.js").StringSele
         const skillId = hasRole ? "role.revoke" : "role.assign";
         parseSkillInput(skillId, { panelId: panel.id, key: binding.key });
         assertSkillPermissions(skillId, member);
-        if (hasRole) { await member.roles.remove(role, `Autocord panel ${panel.id}`); changed.push({ role, added: false }); }
-        else { await member.roles.add(role, `Autocord panel ${panel.id}`); changed.push({ role, added: true }); }
+        if (hasRole) { await changeMemberRole(member, role, false, `Autocord panel ${panel.id}`); changed.push({ role, added: false }); }
+        else { await changeMemberRole(member, role, true, `Autocord panel ${panel.id}`); changed.push({ role, added: true }); }
       } else if (kind === "rolepanel") {
         const shouldHave = chosenKeys.has(binding.key);
         if (shouldHave !== hasRole) {
           const skillId = shouldHave ? "role.assign" : "role.revoke";
           parseSkillInput(skillId, { panelId: panel.id, key: binding.key });
           assertSkillPermissions(skillId, member);
-          if (shouldHave) { await member.roles.add(role, `Autocord panel ${panel.id}`); changed.push({ role, added: true }); }
-          else { await member.roles.remove(role, `Autocord panel ${panel.id}`); changed.push({ role, added: false }); }
+           if (shouldHave) { await changeMemberRole(member, role, true, `Autocord panel ${panel.id}`); changed.push({ role, added: true }); }
+           else { await changeMemberRole(member, role, false, `Autocord panel ${panel.id}`); changed.push({ role, added: false }); }
         }
       }
     }
@@ -742,7 +767,7 @@ async function handlePanelComponent(interaction: import("discord.js").StringSele
         if (role?.id && member.roles.cache.has(role.id)) {
           parseSkillInput("role.revoke", { panelId: panel.id, key: binding.key });
           assertSkillPermissions("role.revoke", member);
-          await member.roles.remove(role, `Autocord single-choice panel ${panel.id}`);
+          await changeMemberRole(member, role, false, `Autocord single-choice panel ${panel.id}`);
           changed.push({ role, added: false });
         }
       }
@@ -759,7 +784,7 @@ async function handlePanelComponent(interaction: import("discord.js").StringSele
       const shouldHave = initialRoleIds.has(role.id);
       const currentlyHas = refreshedMember.roles.cache.has(role.id);
       if (shouldHave !== currentlyHas) {
-        await refreshedMember.roles[shouldHave ? "add" : "remove"](role, `Autocord compensation for panel ${panel.id}`).catch(() => { compensationFailed = true; });
+        await changeMemberRole(refreshedMember, role, shouldHave, `Autocord compensation for panel ${panel.id}`).catch(() => { compensationFailed = true; });
       }
     }
     await db.insert(auditEvents).values({ id: randomUUID(), jobId: operationId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "panel.member_roles", outcome: compensationFailed ? "recovery_required" : "compensated", detail: { panelId: panel.id, changed: changed.map(({ role, added }) => ({ roleId: role.id, added })) } });
@@ -856,6 +881,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       const member = await interaction.guild.members.fetch(interaction.user.id);
       const subcommand = interaction.options.getSubcommand();
+      const workflowControls: Record<string, { skill: AgentSkillId; action: "pause" | "resume" | "disable" | "delete" }> = {
+        "workflow-pause": { skill: "workflow.pause", action: "pause" },
+        "workflow-resume": { skill: "workflow.resume", action: "resume" },
+        "workflow-disable": { skill: "workflow.disable", action: "disable" },
+        "workflow-delete": { skill: "workflow.delete", action: "delete" },
+      };
+      const workflowControl = workflowControls[subcommand];
+      if (workflowControl) {
+        const workflowId = interaction.options.getString("workflow_id", true);
+        parseSkillInput(workflowControl.skill, { workflowId });
+        assertSkillPermissions(workflowControl.skill, member);
+        return void await interaction.editReply(await controlInteractiveWorkflow(interaction.guild, workflowId, member, workflowControl.action));
+      }
       if (subcommand === "status") {
         const jobId = interaction.options.getString("job_id", true);
         parseSkillInput("job.status", { jobId });
@@ -881,9 +919,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       if (subcommand === "workflows") {
         parseSkillInput("workflow.list", {});
-        const rows = await db.select({ id: interactiveWorkflows.id, name: interactiveWorkflows.name, version: interactiveWorkflows.version, channelId: interactiveWorkflows.channelId, messageId: interactiveWorkflows.messageId })
-          .from(interactiveWorkflows).where(and(eq(interactiveWorkflows.guildId, interaction.guildId!), eq(interactiveWorkflows.state, "ACTIVE"))).orderBy(sql`${interactiveWorkflows.createdAt} desc`).limit(25);
-        return void await interaction.editReply(rows.length ? rows.map((workflow) => `• ${workflow.name} (v${workflow.version}, ID: ${workflow.id}, channel: ${workflow.channelId}, message: ${workflow.messageId})`).join("\n") : "Interactive Workflowはありません。");
+        const rows = await db.select({ id: interactiveWorkflows.id, name: interactiveWorkflows.name, version: interactiveWorkflows.version, state: interactiveWorkflows.state, channelId: interactiveWorkflows.channelId, messageId: interactiveWorkflows.messageId })
+          .from(interactiveWorkflows).where(and(eq(interactiveWorkflows.guildId, interaction.guildId!), inArray(interactiveWorkflows.state, ["ACTIVE", "PAUSED", "DISABLED"]))).orderBy(sql`${interactiveWorkflows.createdAt} desc`).limit(25);
+        return void await interaction.editReply(rows.length ? rows.map((workflow) => `• ${workflow.name} (${workflow.state}, v${workflow.version}, ID: ${workflow.id}, channel: ${workflow.channelId}, message: ${workflow.messageId})`).join("\n") : "Interactive Workflowはありません。");
       }
       if (subcommand === "undo") {
         const input = parseSkillInput("panel.undo", { id: interaction.options.getString("job_id", true) }) as { id: string };
@@ -1068,6 +1106,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   void handleWorkflowVoiceStateUpdate(oldState, newState).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.voice_state_dispatch_failed", guildId: newState.guild.id, error: error instanceof Error ? error.message : "unknown" })));
 });
+client.on(Events.GuildMemberAdd, (member) => { void handleWorkflowMemberJoin(member as GuildMember).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.member_join_dispatch_failed", guildId: member.guild.id, error: error instanceof Error ? error.message : "unknown" }))); });
+client.on(Events.GuildMemberRemove, (member) => { void handleWorkflowMemberLeave(member as GuildMember).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.member_leave_dispatch_failed", guildId: member.guild.id, error: error instanceof Error ? error.message : "unknown" }))); });
+client.on(Events.GuildMemberUpdate, (oldMember, newMember) => { void handleWorkflowMemberRoleUpdate(oldMember as GuildMember, newMember as GuildMember).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.member_role_dispatch_failed", guildId: newMember.guild.id, error: error instanceof Error ? error.message : "unknown" }))); });
+client.on(Events.MessageCreate, (message) => { void handleWorkflowMessageCreate(message as import("discord.js").Message).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.message_create_dispatch_failed", guildId: message.guildId, error: error instanceof Error ? error.message : "unknown" }))); });
+client.on(Events.MessageDelete, (message) => { void handleWorkflowMessageDelete(message as import("discord.js").Message).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.message_delete_dispatch_failed", guildId: message.guildId, error: error instanceof Error ? error.message : "unknown" }))); });
+client.on(Events.MessageReactionAdd, (reaction, user) => { void handleWorkflowReactionAdd(reaction as import("discord.js").MessageReaction, user as import("discord.js").User).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.reaction_add_dispatch_failed", error: error instanceof Error ? error.message : "unknown" }))); });
+client.on(Events.MessageReactionRemove, (reaction, user) => { void handleWorkflowReactionRemove(reaction as import("discord.js").MessageReaction, user as import("discord.js").User).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.reaction_remove_dispatch_failed", error: error instanceof Error ? error.message : "unknown" }))); });
 
 client.once(Events.ClientReady, async (ready) => {
   console.info(JSON.stringify({ level: "info", event: "bot.ready", user: ready.user.tag, workerId }));
@@ -1083,9 +1128,11 @@ client.once(Events.ClientReady, async (ready) => {
   setInterval(() => void dispatchGiveawayNotifications().catch((error) => console.error("giveaway notification dispatcher failed", error)), 5_000).unref();
   setInterval(() => void recoverStaleInteractiveRuns().then((count) => { if (count) console.warn(JSON.stringify({ level: "warn", event: "workflow.runs_recovery_required", count })); }).catch((error) => console.error("interactive workflow recovery failed", error)), 60_000).unref();
   setInterval(() => void dispatchWorkflowSchedules(client).catch((error) => console.error("workflow schedule dispatcher failed", error)), 10_000).unref();
+  setInterval(() => void dispatchWorkflowWaits(client).catch((error) => console.error("workflow wait dispatcher failed", error)), 1_000).unref();
   setInterval(() => void cleanupEmptyWorkflowVoiceChannels(client).catch((error) => console.error("workflow voice cleanup failed", error)), 30_000).unref();
   void dispatchGiveawayNotifications().catch((error) => console.error("initial giveaway notification dispatch failed", error));
   void dispatchWorkflowSchedules(client).catch((error) => console.error("initial workflow schedule dispatch failed", error));
+  void dispatchWorkflowWaits(client).catch((error) => console.error("initial workflow wait dispatch failed", error));
   void cleanupEmptyWorkflowVoiceChannels(client).catch((error) => console.error("initial workflow voice cleanup failed", error));
 });
 

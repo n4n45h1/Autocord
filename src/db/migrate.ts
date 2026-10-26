@@ -71,10 +71,17 @@ try {
       guild_id text NOT NULL, role_id text NOT NULL, owner_job_id text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(guild_id, role_id)
     );
+    CREATE INDEX IF NOT EXISTS managed_roles_owner_idx ON managed_roles(guild_id, owner_job_id);
     CREATE TABLE IF NOT EXISTS managed_channels (
       guild_id text NOT NULL, channel_id text NOT NULL, owner_job_id text NOT NULL,
-      kind text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(guild_id, channel_id)
+      kind text NOT NULL, created_for_member_id text, staff_role_id text,
+      created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(guild_id, channel_id)
     );
+    ALTER TABLE managed_channels ADD COLUMN IF NOT EXISTS created_for_member_id text;
+    ALTER TABLE managed_channels ADD COLUMN IF NOT EXISTS staff_role_id text;
+    CREATE INDEX IF NOT EXISTS managed_channels_owner_idx ON managed_channels(guild_id, owner_job_id, kind);
+    CREATE INDEX IF NOT EXISTS managed_channels_ticket_owner_idx ON managed_channels(guild_id, owner_job_id, kind, created_for_member_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS managed_channels_ticket_member_idx ON managed_channels(guild_id, owner_job_id, created_for_member_id) WHERE kind = 'ticket' AND created_for_member_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS panel_revisions (
       id text PRIMARY KEY, panel_id text NOT NULL REFERENCES panels(id) ON DELETE CASCADE,
       guild_id text NOT NULL, job_id text NOT NULL, revision integer NOT NULL,
@@ -149,6 +156,13 @@ try {
       UNIQUE(workflow_id, scope, scope_id, collection, item_key)
     );
     CREATE INDEX IF NOT EXISTS workflow_collections_count_idx ON workflow_collections(workflow_id, scope, scope_id, collection, created_at);
+    CREATE TABLE IF NOT EXISTS workflow_messages (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, run_id text NOT NULL, step_id text NOT NULL,
+      channel_id text NOT NULL, message_id text NOT NULL, state text NOT NULL DEFAULT 'ACTIVE',
+      created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(guild_id, message_id), UNIQUE(workflow_id, run_id, step_id)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_messages_workflow_state_idx ON workflow_messages(workflow_id, state);
     CREATE TABLE IF NOT EXISTS workflow_runs (
       id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
       guild_id text NOT NULL, interaction_id text NOT NULL, trigger_id text NOT NULL, actor_id text NOT NULL,
@@ -157,6 +171,16 @@ try {
       UNIQUE(guild_id, interaction_id)
     );
     CREATE INDEX IF NOT EXISTS workflow_runs_workflow_state_idx ON workflow_runs(workflow_id, state);
+    CREATE TABLE IF NOT EXISTS workflow_waits (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, run_id text NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+      trigger_id text NOT NULL, step_id text NOT NULL, member_id text, due_at timestamptz NOT NULL,
+      state text NOT NULL DEFAULT 'ACTIVE', context jsonb NOT NULL, attempts integer NOT NULL DEFAULT 0,
+      lease_owner text, lease_expires_at timestamptz, last_error text, created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(run_id, step_id)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_waits_due_idx ON workflow_waits(state, due_at);
+    CREATE INDEX IF NOT EXISTS workflow_waits_guild_idx ON workflow_waits(guild_id, state);
     CREATE TABLE IF NOT EXISTS workflow_schedules (
       id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
       guild_id text NOT NULL, trigger_id text NOT NULL, event text NOT NULL, interval_seconds integer,

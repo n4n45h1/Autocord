@@ -4,6 +4,8 @@ const key = z.string().regex(/^[a-z0-9._-]{1,40}$/);
 const scalar = z.union([z.string().max(1000), z.number(), z.boolean(), z.null()]);
 const finiteNumber = z.number().finite().min(-1_000_000_000_000).max(1_000_000_000_000);
 const numericOperand = z.union([finiteNumber, z.string().max(100)]);
+const stateMutationActions = ["state.set", "state.increment", "state.decrement", "state.multiply", "state.debit", "state.delete", "state.reset", "state.append", "state.remove"];
+const collectionMutationActions = ["collection.add", "collection.remove", "collection.clear"];
 const conditionLeaf = z.discriminatedUnion("op", [
   z.object({ op: z.literal("entries.lt"), collection: key, value: z.number().int().min(0).max(1000) }).strict(),
   z.object({ op: z.literal("entries.gte"), collection: key, value: z.number().int().min(0).max(1000) }).strict(),
@@ -14,7 +16,7 @@ const conditionLeaf = z.discriminatedUnion("op", [
   z.object({ op: z.literal("state.exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ op: z.literal("state.not_exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ op: z.literal("member.has_role"), roleName: z.string().min(1).max(100) }).strict(),
-  z.object({ op: z.literal("member.has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "Administrator"]) }).strict(),
+  z.object({ op: z.literal("member.has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "MoveMembers", "Administrator"]) }).strict(),
   z.object({ op: z.literal("time.within"), startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict().refine((condition) => Date.parse(condition.endAt) > Date.parse(condition.startAt), "time.within endAt must follow startAt"),
   z.object({ op: z.literal("random.chance"), percent: z.number().min(0).max(100) }).strict(),
   z.object({ op: z.literal("result.equals"), stepId: key, field: key, value: scalar }).strict(),
@@ -72,20 +74,35 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("state.increment"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand }).strict(),
   z.object({ ...stepBase, action: z.literal("state.decrement"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand }).strict(),
   z.object({ ...stepBase, action: z.literal("state.multiply"), scope: z.enum(["workflow", "guild", "member"]), key, factor: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.debit"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand, minimumBalance: numericOperand }).strict(),
   z.object({ ...stepBase, action: z.literal("state.delete"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ ...stepBase, action: z.literal("state.reset"), scope: z.enum(["workflow", "guild", "member"]), key: key.nullable(), value: scalar.default(null) }).strict(),
   z.object({ ...stepBase, action: z.literal("state.append"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
   z.object({ ...stepBase, action: z.literal("state.remove"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
   z.object({ ...stepBase, action: z.literal("role.grant"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("role.revoke"), roleName: z.string().min(1).max(100) }).strict(),
-  z.object({ ...stepBase, action: z.literal("message.send"), delivery: z.enum(["workflow_channel", "workflow_owner_dm"]).default("workflow_channel"), content: z.string().min(1).max(1900) }).strict(),
-  z.object({ ...stepBase, action: z.literal("message.edit"), content: z.string().max(1900) }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.send"), delivery: z.enum(["workflow_channel", "workflow_owner_dm", "workflow_channel_step"]).default("workflow_channel"), content: z.string().min(1).max(1900), channelStepId: key.nullable().default(null) }).strict().refine((step) => (step.delivery === "workflow_channel_step") === Boolean(step.channelStepId), "workflow_channel_step requires channelStepId; other deliveries must omit it"),
+  z.object({ ...stepBase, action: z.literal("message.edit"), content: z.string().max(1900), targetStepId: key.nullable().default(null) }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.reply"), content: z.string().min(1).max(1900) }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.dm"), recipient: z.enum(["trigger_member", "workflow_owner"]), content: z.string().min(1).max(1900) }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.delete"), targetStepId: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.pin"), targetStepId: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.unpin"), targetStepId: key }).strict(),
   z.object({ ...stepBase, action: z.literal("panel.refresh") }).strict(),
   z.object({ ...stepBase, action: z.literal("voice.channel.create"), name: z.string().min(1).max(100), moveMembers: z.boolean().default(true) }).strict(),
   z.object({ ...stepBase, action: z.literal("voice.channel.delete") }).strict(),
   z.object({ ...stepBase, action: z.literal("resource.role.create"), name: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("resource.channel.create_category"), name: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("resource.channel.create_text"), name: z.string().min(1).max(100), topic: z.string().max(1024).nullable(), categoryStepId: key.nullable() }).strict(),
+  z.object({ ...stepBase, action: z.literal("channel.create_voice"), name: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("channel.create_text"), name: z.string().min(1).max(100), topic: z.string().max(1024).nullable(), visibility: z.enum(["guild_default", "private_member", "staff_only"]).default("guild_default"), staffRoleId: z.string().regex(/^\d{17,20}$/).nullable().default(null) }).strict().refine((step) => (step.visibility === "staff_only") === Boolean(step.staffRoleId), "staff_only requires staffRoleId; other visibility presets must omit it"),
+  z.object({ ...stepBase, action: z.literal("channel.rename"), channelStepId: key, name: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("channel.delete"), channelStepId: key.nullable().default(null), channelId: z.string().max(100).nullable().default(null) }).strict().refine((step) => Boolean(step.channelStepId) !== Boolean(step.channelId), "channel.delete requires exactly one of channelStepId or channelId"),
+  z.object({ ...stepBase, action: z.literal("channel.set_permission"), channelStepId: key, preset: z.enum(["private_member", "staff_only"]), staffRoleId: z.string().regex(/^\d{17,20}$/).nullable() }).strict().refine((step) => (step.preset === "staff_only") === Boolean(step.staffRoleId), "staff_only requires staffRoleId; private_member must omit it"),
+  z.object({ ...stepBase, action: z.literal("channel.move_member"), channelStepId: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("channel.get_members"), channelStepId: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("role.rename"), roleName: z.string().min(1).max(100), name: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("role.member_count"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("giveaway.create"), prize: z.string().min(1).max(100), durationSeconds: z.number().int().min(60).max(604800), winnerCount: z.number().int().min(1).max(20) }).strict(),
   z.object({ ...stepBase, action: z.literal("giveaway.join"), giveawayId: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("giveaway.leave"), giveawayId: z.string().min(1).max(100) }).strict(),
@@ -103,13 +120,14 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("random.integer"), min: z.number().int().min(-1_000_000_000).max(1_000_000_000), max: z.number().int().min(-1_000_000_000).max(1_000_000_000) }).strict().refine((step) => step.max >= step.min, "random.integer max must be >= min"),
   z.object({ ...stepBase, action: z.literal("random.choice"), values: z.array(scalar).min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("random.weighted_choice"), options: z.array(z.object({ value: scalar, weight: z.number().int().min(1).max(1_000_000) }).strict()).min(1).max(100) }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.add"), scope: z.enum(["workflow", "guild", "member"]), collection: key, item: scalar, maxItems: z.number().int().min(1).max(10000).default(1000) }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.remove"), scope: z.enum(["workflow", "guild", "member"]), collection: key, item: scalar }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.count"), scope: z.enum(["workflow", "guild", "member"]), collection: key }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.contains"), scope: z.enum(["workflow", "guild", "member"]), collection: key, item: scalar }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.list"), scope: z.enum(["workflow", "guild", "member"]), collection: key, limit: z.number().int().min(1).max(100).default(50) }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.rank"), scope: z.enum(["workflow", "guild", "member"]), collection: key, value: numericOperand, order: z.enum(["asc", "desc"]).default("desc") }).strict(),
-  z.object({ ...stepBase, action: z.literal("collection.clear"), scope: z.enum(["workflow", "guild", "member"]), collection: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.add"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false), item: scalar, maxItems: z.number().int().min(1).max(10000).default(1000) }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.remove"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false), item: scalar }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.count"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false) }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.contains"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false), item: scalar }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.list"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false), limit: z.number().int().min(1).max(100).default(50) }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.rank"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false), value: numericOperand, order: z.enum(["asc", "desc"]).default("desc") }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.clear"), scope: z.enum(["workflow", "guild", "member"]), collection: key, partitionByMessage: z.boolean().default(false) }).strict(),
+  z.object({ ...stepBase, action: z.literal("workflow.wait"), seconds: z.number().int().min(1).max(2_592_000) }).strict(),
 ]);
 
 const buttonComponent = z.object({ key, kind: z.literal("button"), label: z.string().min(1).max(80), style: z.enum(["primary", "secondary", "success", "danger"]), emoji: z.string().max(64).nullable(), disabledWhen: workflowConditionSchema.nullable().optional(), triggerId: key }).strict();
@@ -129,9 +147,17 @@ const modalComponent = z.object({
 export const interactiveWorkflowTriggerSchema = z.discriminatedUnion("event", [
   z.object({ id: key, event: z.enum(["button", "select", "modal_submit"]), componentKey: key, steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.literal("schedule"), intervalSeconds: z.number().int().min(60).max(604800), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.literal("schedule.at"), dayOfWeek: z.number().int().min(0).max(6), hour: z.number().int().min(0).max(23), minute: z.number().int().min(0).max(59), timeZone: z.string().min(1).max(64), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict().superRefine((trigger, ctx) => {
+    try { new Intl.DateTimeFormat("en-US", { timeZone: trigger.timeZone }).format(new Date()); }
+    catch { ctx.addIssue({ code: "custom", message: `Invalid IANA time zone: ${trigger.timeZone}` }); }
+  }),
   z.object({ id: key, event: z.literal("deadline"), afterSeconds: z.number().int().min(60).max(2_592_000), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.literal("voice.member_join_event"), voiceChannelId: z.string().regex(/^\d{17,20}$/), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.literal("voice.member_leave_event"), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.enum(["member.join", "member.leave"]), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.enum(["member.role_added", "member.role_removed"]), roleId: z.string().regex(/^\d{17,20}$/), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.enum(["message.created", "message.deleted"]), channelId: z.union([z.string().regex(/^\d{17,20}$/), z.literal("workflow_channel")]), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.enum(["reaction.added", "reaction.removed"]), channelId: z.union([z.string().regex(/^\d{17,20}$/), z.literal("workflow_channel")]), messageStepId: key, emoji: z.string().min(1).max(100).nullable(), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
 ]);
 
 export const interactiveWorkflowDraftSchema = z.object({
@@ -181,9 +207,28 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
     for (const step of trigger.steps) {
       const text = Object.values(step).filter((value): value is string => typeof value === "string").join("\n");
       for (const match of text.matchAll(/\{\{result:([a-z0-9._-]{1,40}):[a-z0-9._-]{1,40}\}\}/g)) requireResultDependency(step.id, match[1]!, `Step ${step.id}`);
+      if ((step.action === "message.delete" || step.action === "message.pin" || step.action === "message.unpin" || step.action === "message.edit" && step.targetStepId) && "targetStepId" in step && step.targetStepId) {
+        const target = stepById.get(step.targetStepId);
+        requireResultDependency(step.id, step.targetStepId, `Step ${step.id}`);
+        if (!target || !["message.send", "message.reply", "message.dm"].includes(target.action)) ctx.addIssue({ code: "custom", message: `Step ${step.id} must reference a Workflow message-producing step.` });
+      }
+      if ("channelStepId" in step && step.channelStepId) {
+        const target = stepById.get(step.channelStepId);
+        requireResultDependency(step.id, step.channelStepId, `Step ${step.id}`);
+        const allowedTargets = step.action === "channel.set_permission" ? ["resource.channel.create_text", "channel.create_text"]
+          : step.action === "message.send" ? ["resource.channel.create_text", "channel.create_text"]
+          : step.action === "channel.move_member" || step.action === "channel.get_members" ? ["channel.create_voice", "voice.channel.create"]
+            : ["resource.channel.create_text", "resource.channel.create_category", "channel.create_voice", "channel.create_text", "voice.channel.create"];
+        if (!target || !allowedTargets.includes(target.action)) ctx.addIssue({ code: "custom", message: `Step ${step.id} references an incompatible Workflow-created channel step.` });
+      }
+      if (step.action === "message.send" && step.delivery === "workflow_channel_step" && !step.channelStepId) ctx.addIssue({ code: "custom", message: "workflow_channel_step requires a channelStepId." });
+      if (step.action === "message.reply" && trigger.event !== "message.created") ctx.addIssue({ code: "custom", message: "message.reply requires a message.created trigger context." });
+      if (step.action === "message.dm" && trigger.event === "schedule" && step.recipient !== "workflow_owner") ctx.addIssue({ code: "custom", message: "Scheduled message.dm may only target the Workflow owner." });
       const conditions = conditionsOf(step.when);
       for (const condition of conditions) if (condition.op === "result.equals") requireResultDependency(step.id, condition.stepId, `Condition on ${step.id}`);
+      if ("partitionByMessage" in step && step.partitionByMessage && trigger.event !== "reaction.added" && trigger.event !== "reaction.removed") ctx.addIssue({ code: "custom", message: "partitionByMessage is limited to reaction event triggers." });
     }
+    if ((trigger.event === "reaction.added" || trigger.event === "reaction.removed") && !workflow.triggers.some((candidate) => candidate.steps.some((step) => step.id === trigger.messageStepId && step.action === "message.send" && step.delivery === "workflow_channel"))) ctx.addIssue({ code: "custom", message: `Reaction trigger ${trigger.id} must target a workflow_channel message.send step.` });
     const pending = new Set(trigger.steps.map((step) => step.id));
     while (pending.size) {
       const ready = trigger.steps.filter((step) => pending.has(step.id) && step.dependsOn.every((dependency) => !pending.has(dependency)));
@@ -193,15 +238,15 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       }
       for (const step of ready) pending.delete(step.id);
     }
-    const panelMutationSteps = trigger.steps.filter((step) => step.action.startsWith("state.") || step.action.startsWith("collection.") || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
+    const panelMutationSteps = trigger.steps.filter((step) => stateMutationActions.includes(step.action) || collectionMutationActions.includes(step.action) || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "channel.create_voice", "channel.create_text", "channel.rename", "channel.delete", "channel.set_permission", "role.rename", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
     if (panelMutationSteps.length) {
       const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
       if (!refresh) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} must refresh its UI after changing Workflow-visible state/resources.` });
       else for (const mutation of panelMutationSteps) if (!dependsOnAncestor(refresh.id, mutation.id)) ctx.addIssue({ code: "custom", message: `Panel refresh in ${trigger.id} must depend on mutation ${mutation.id}.` });
     }
-    if (trigger.event === "schedule" || trigger.event === "deadline") {
+    if (trigger.event === "schedule" || trigger.event === "schedule.at" || trigger.event === "deadline") {
       for (const step of trigger.steps) {
-        if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke" || step.action === "voice.channel.create" || step.action === "voice.channel.delete" || step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway.")) ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member/resource action ${step.action}.` });
+        if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke" || step.action === "role.rename" || step.action === "voice.channel.create" || step.action === "voice.channel.delete" || step.action.startsWith("channel.create_") || step.action === "channel.rename" || step.action === "channel.delete" || step.action === "channel.set_permission" || step.action === "channel.move_member" || step.action === "channel.create_text" || step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway.")) ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member/resource action ${step.action}.` });
         if ((step.action.startsWith("state.") || step.action.startsWith("collection.")) && "scope" in step && step.scope === "member") ctx.addIssue({ code: "custom", message: "Scheduled triggers may not access member-scoped state or collections." });
         if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate VoiceState conditions." });
         if (step.when && conditionLeaves(step.when).some((condition) => condition.op === "member.has_role" || condition.op === "member.has_permission" || ("scope" in condition && condition.scope === "member"))) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate member-only conditions or member-scoped data." });
@@ -216,11 +261,30 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       if (trigger.steps.some((step) => step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway."))) ctx.addIssue({ code: "custom", message: "Resource and giveaway management actions are only available on explicit component/modal triggers." });
       continue;
     }
+    if (trigger.event === "member.join" || trigger.event === "member.leave" || trigger.event === "member.role_added" || trigger.event === "member.role_removed"
+      || trigger.event === "message.created" || trigger.event === "message.deleted" || trigger.event === "reaction.added" || trigger.event === "reaction.removed") {
+      for (const step of trigger.steps) {
+        if (step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action === "channel.create_text" || step.action.startsWith("channel.create_") || step.action === "channel.rename" || step.action === "channel.delete" || step.action === "channel.set_permission" || step.action === "channel.move_member" || step.action === "role.rename" || step.action.startsWith("giveaway.") || step.action === "voice.channel.create" || step.action === "voice.channel.delete") {
+          ctx.addIssue({ code: "custom", message: `Gateway event trigger cannot use administrative/resource action ${step.action}.` });
+        }
+        if (step.action === "message.dm") ctx.addIssue({ code: "custom", message: "message.dm is limited to explicit interactions and scheduled Workflow-owner notifications to prevent member-event DM bursts." });
+        if (step.action === "message.send" && step.delivery === "workflow_owner_dm") {
+          const guards = step.when?.op === "and" ? step.when.conditions : [];
+          const hasUniqueAddGuard = guards.some((condition) => condition.op === "result.equals" && condition.field === "added" && condition.value === true && trigger.steps.some((candidate) => candidate.id === condition.stepId && candidate.action === "collection.add" && candidate.partitionByMessage));
+          const hasMessageCountGuard = guards.some((condition) => condition.op === "result.equals" && condition.field === "count" && typeof condition.value === "number" && trigger.steps.some((candidate) => candidate.id === condition.stepId && candidate.action === "collection.count" && candidate.partitionByMessage));
+          if (trigger.event !== "reaction.added" || !hasUniqueAddGuard || !hasMessageCountGuard) ctx.addIssue({ code: "custom", message: "Gateway-triggered owner DM requires a reaction.added event, partitioned unique add guard and partitioned count threshold guard." });
+        }
+        if (step.action === "message.reply" && trigger.event !== "message.created") ctx.addIssue({ code: "custom", message: "message.reply requires a message.created trigger context." });
+      }
+      continue;
+    }
+    if (!("componentKey" in trigger)) continue;
     for (const step of trigger.steps) {
       if (step.action === "voice.channel.create" || step.action === "voice.channel.delete") ctx.addIssue({ code: "custom", message: "Voice channel actions require VoiceState event triggers." });
       if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "VoiceState conditions require VoiceState event triggers." });
-      const requiredPermission = step.action === "resource.role.create" ? "ManageRoles"
-        : step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" ? "ManageChannels"
+      const requiredPermission = step.action === "resource.role.create" || step.action === "role.rename" ? "ManageRoles"
+        : step.action === "channel.move_member" ? "MoveMembers"
+        : step.action === "channel.create_text" && step.visibility === "guild_default" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action === "channel.create_voice" || step.action === "channel.rename" || step.action === "channel.set_permission" ? "ManageChannels"
           : step.action === "giveaway.create" || step.action === "giveaway.end" || step.action === "giveaway.reroll" || step.action === "giveaway.pause" || step.action === "giveaway.resume" ? "ManageRoles"
           : null;
       if (requiredPermission) {
@@ -276,7 +340,7 @@ export function compileInteractiveWorkflow(input: unknown): InteractiveWorkflow 
   const compiled = structuredClone(workflow);
   const collections = new Set<string>();
   for (const trigger of compiled.triggers) {
-    const mutationStepIds = trigger.steps.filter((step) => step.action.startsWith("state.") || step.action.startsWith("collection.") || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
+    const mutationStepIds = trigger.steps.filter((step) => stateMutationActions.includes(step.action) || collectionMutationActions.includes(step.action) || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "channel.create_voice", "channel.create_text", "channel.rename", "channel.delete", "channel.set_permission", "role.rename", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
     for (const step of trigger.steps) if (step.action === "entry.join" || step.action === "entry.leave") collections.add(step.collection);
     const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
     if (refresh) refresh.dependsOn = [...new Set([...refresh.dependsOn, ...mutationStepIds])];

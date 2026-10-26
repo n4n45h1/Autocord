@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { addWorkflowCollectionItem, mutateWorkflowNumber } from "./data.js";
+import { addWorkflowCollectionItem, debitWorkflowNumber, mutateWorkflowNumber } from "./data.js";
 
 const postgresTests = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -52,5 +52,12 @@ postgresTests("Workflow state and collection PostgreSQL primitives", () => {
     expect(additions.filter((result) => result.status === "rejected")).toHaveLength(2);
     const rows = await db.select({ id: workflowCollections.id }).from(workflowCollections).where(and(eq(workflowCollections.workflowId, workflowA), eq(workflowCollections.collection, "inventory")));
     expect(rows).toHaveLength(3);
+  });
+
+  it("atomically prevents concurrent point redemptions below the required balance", async () => {
+    await mutateWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "redeemer", key: "points", operation: "increment", amount: 1000 });
+    const redemptions = await Promise.all(Array.from({ length: 6 }, () => debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "redeemer", key: "points", amount: 500, minimumBalance: 500 })));
+    expect(redemptions.filter((result) => result.debited)).toHaveLength(2);
+    expect(redemptions.at(-1)?.value).toBe(0);
   });
 });

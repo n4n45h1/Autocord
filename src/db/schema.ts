@@ -1,4 +1,5 @@
 import { pgTable, text, timestamp, integer, jsonb, uniqueIndex, primaryKey, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 export const agentJobs = pgTable("agent_jobs", {
   id: text("id").primaryKey(),
@@ -77,15 +78,17 @@ export const managedRoles = pgTable("managed_roles", {
   roleId: text("role_id").notNull(),
   ownerJobId: text("owner_job_id").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, (table) => [primaryKey({ columns: [table.guildId, table.roleId] })]);
+}, (table) => [primaryKey({ columns: [table.guildId, table.roleId] }), index("managed_roles_owner_idx").on(table.guildId, table.ownerJobId)]);
 
 export const managedChannels = pgTable("managed_channels", {
   guildId: text("guild_id").notNull(),
   channelId: text("channel_id").notNull(),
   ownerJobId: text("owner_job_id").notNull(),
   kind: text("kind").notNull(),
+  createdForMemberId: text("created_for_member_id"),
+  staffRoleId: text("staff_role_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
-}, (table) => [primaryKey({ columns: [table.guildId, table.channelId] })]);
+}, (table) => [primaryKey({ columns: [table.guildId, table.channelId] }), index("managed_channels_owner_idx").on(table.guildId, table.ownerJobId, table.kind), index("managed_channels_ticket_owner_idx").on(table.guildId, table.ownerJobId, table.kind, table.createdForMemberId), uniqueIndex("managed_channels_ticket_member_idx").on(table.guildId, table.ownerJobId, table.createdForMemberId).where(sql`${table.kind} = 'ticket' AND ${table.createdForMemberId} IS NOT NULL`)]);
 
 export const panelRevisions = pgTable("panel_revisions", {
   id: text("id").primaryKey(),
@@ -220,6 +223,18 @@ export const workflowCollections = pgTable("workflow_collections", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [uniqueIndex("workflow_collections_item_idx").on(table.workflowId, table.scope, table.scopeId, table.collection, table.itemKey), index("workflow_collections_count_idx").on(table.workflowId, table.scope, table.scopeId, table.collection, table.createdAt)]);
 
+export const workflowMessages = pgTable("workflow_messages", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  runId: text("run_id").notNull(),
+  stepId: text("step_id").notNull(),
+  channelId: text("channel_id").notNull(),
+  messageId: text("message_id").notNull(),
+  state: text("state").default("ACTIVE").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("workflow_messages_guild_message_idx").on(table.guildId, table.messageId), uniqueIndex("workflow_messages_run_step_idx").on(table.workflowId, table.runId, table.stepId), index("workflow_messages_workflow_state_idx").on(table.workflowId, table.state)]);
+
 export const workflowRuns = pgTable("workflow_runs", {
   id: text("id").primaryKey(),
   workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
@@ -234,6 +249,24 @@ export const workflowRuns = pgTable("workflow_runs", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [uniqueIndex("workflow_runs_interaction_idx").on(table.guildId, table.interactionId), index("workflow_runs_workflow_state_idx").on(table.workflowId, table.state)]);
+
+export const workflowWaits = pgTable("workflow_waits", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  runId: text("run_id").notNull().references(() => workflowRuns.id, { onDelete: "cascade" }),
+  triggerId: text("trigger_id").notNull(),
+  stepId: text("step_id").notNull(),
+  memberId: text("member_id"),
+  dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+  state: text("state").default("ACTIVE").notNull(),
+  context: jsonb("context").notNull(),
+  attempts: integer("attempts").default(0).notNull(),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  lastError: text("last_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("workflow_waits_run_step_idx").on(table.runId, table.stepId), index("workflow_waits_due_idx").on(table.state, table.dueAt), index("workflow_waits_guild_idx").on(table.guildId, table.state)]);
 
 export const workflowSchedules = pgTable("workflow_schedules", {
   id: text("id").primaryKey(),
