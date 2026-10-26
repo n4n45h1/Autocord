@@ -132,6 +132,7 @@ function interactiveWorkflowSummary(workflow: InteractiveWorkflow): string {
       case "giveaway.pause": return `giveaway.pause ${step.giveawayId}`;
       case "giveaway.resume": return `giveaway.resume ${step.giveawayId}`;
       case "giveaway.reroll": return `giveaway.reroll ${step.giveawayId}`;
+      default: return JSON.stringify(step);
     }
   };
   const componentSummary = workflow.components.map((component) => {

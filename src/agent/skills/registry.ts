@@ -6,6 +6,11 @@ import { interactiveWorkflowSchema, interactiveWorkflowStepSchema, interactiveWo
 const emptyInput = z.object({}).strict();
 const idInput = z.object({ id: z.string().min(1).max(80) }).strict();
 const giveawayIdInput = z.object({ giveawayId: z.string().min(1).max(80) }).strict();
+const workflowActionSkill = (action: string) => ({
+  inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === action, `${action} action required`),
+  requiredPermissions: [] as const, targetScope: "authenticated-workflow-and-declared-scope", risk: "workflow-state-write",
+  approval: { required: false, binds: ["guildId", "workflowId", "stepId"] }, effects: [action],
+});
 
 export const agentSkills = {
   "skills.list": {
@@ -85,6 +90,31 @@ export const agentSkills = {
     requiredPermissions: [], targetScope: "declared-workflow-state-key", risk: "workflow-state-write",
     approval: { required: false, binds: ["workflowId", "stepId", "scope", "stateKey"] }, effects: ["workflow.state.upsert"],
   },
+  "workflow.state.get": workflowActionSkill("state.get"),
+  "workflow.state.increment": workflowActionSkill("state.increment"),
+  "workflow.state.decrement": workflowActionSkill("state.decrement"),
+  "workflow.state.multiply": workflowActionSkill("state.multiply"),
+  "workflow.state.delete": workflowActionSkill("state.delete"),
+  "workflow.state.reset": workflowActionSkill("state.reset"),
+  "workflow.state.append": workflowActionSkill("state.append"),
+  "workflow.state.remove": workflowActionSkill("state.remove"),
+  "workflow.math.add": workflowActionSkill("math.add"),
+  "workflow.math.subtract": workflowActionSkill("math.subtract"),
+  "workflow.math.multiply": workflowActionSkill("math.multiply"),
+  "workflow.math.divide": workflowActionSkill("math.divide"),
+  "workflow.math.min": workflowActionSkill("math.min"),
+  "workflow.math.max": workflowActionSkill("math.max"),
+  "workflow.math.clamp": workflowActionSkill("math.clamp"),
+  "workflow.random.integer": workflowActionSkill("random.integer"),
+  "workflow.random.choice": workflowActionSkill("random.choice"),
+  "workflow.random.weighted_choice": workflowActionSkill("random.weighted_choice"),
+  "workflow.collection.add": workflowActionSkill("collection.add"),
+  "workflow.collection.remove": workflowActionSkill("collection.remove"),
+  "workflow.collection.count": workflowActionSkill("collection.count"),
+  "workflow.collection.contains": workflowActionSkill("collection.contains"),
+  "workflow.collection.list": workflowActionSkill("collection.list"),
+  "workflow.collection.rank": workflowActionSkill("collection.rank"),
+  "workflow.collection.clear": workflowActionSkill("collection.clear"),
   "workflow.role.grant": {
     inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "role.grant", "workflow.role.grant requires role.grant"),
     requiredPermissions: [], targetScope: "interaction-member-and-owned-permissionless-role", risk: "member-self-role-change",

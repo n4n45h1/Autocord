@@ -1,22 +1,31 @@
-import { randomUUID } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import {
   ActionRowBuilder, ButtonStyle, ChannelType, MessageFlags, ModalBuilder, PermissionFlagsBits, TextInputBuilder, TextInputStyle,
   type ButtonInteraction, type Client, type Guild, type GuildMember, type Interaction, type ModalSubmitInteraction, type StringSelectMenuInteraction, type VoiceState,
 } from "discord.js";
-import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../../db/client.js";
-import { agentJobSteps, agentJobs, auditEvents, giveaways, giveawayEntries, giveawayNotifications, interactiveWorkflowRevisions, interactiveWorkflows, managedChannels, managedRoles, workflowEntries, workflowRuns, workflowStates, workflowSchedules, workflowVoiceChannels } from "../../db/schema.js";
+import { agentJobSteps, agentJobs, auditEvents, giveaways, giveawayEntries, giveawayNotifications, interactiveWorkflowRevisions, interactiveWorkflows, managedChannels, managedRoles, workflowCollections, workflowEntries, workflowRuns, workflowStates, workflowSchedules, workflowVoiceChannels } from "../../db/schema.js";
 import { interactiveWorkflowSchema, orderInteractiveWorkflowSteps, type InteractiveWorkflow, type InteractiveWorkflowStep } from "../../agent/interactive-workflow.js";
 import { assertSelfAssignableRole } from "../../policy.js";
 import { withGuildAdvisoryLock } from "../../jobs/claim.js";
 import { evaluateWorkflowCondition, renderWorkflowTemplate } from "./conditions.js";
 import { renderInteractiveWorkflow } from "./render.js";
+import { addWorkflowCollectionItem, mutateWorkflowNumber } from "./data.js";
+import { calculateAggregateMath, calculateBinaryMath, calculateClamp, selectWeighted } from "./math.js";
 import { drawWinners, giveawayResultMessage } from "../giveaways/draw.js";
 
 type WorkflowRecord = typeof interactiveWorkflows.$inferSelect;
 type WorkflowVoiceSession = typeof workflowVoiceChannels.$inferSelect;
 type WorkflowVoiceContext = { sourceChannelId: string; memberCount: number; session: WorkflowVoiceSession | null };
 const workflowPermissionNames = ["ManageGuild", "ManageRoles", "ManageChannels", "Administrator"] as const;
+
+function workflowConditionCollections(condition: InteractiveWorkflow["components"][number]["disabledWhen"] | InteractiveWorkflow["triggers"][number]["steps"][number]["when"], names: Set<string>): void {
+  if (!condition) return;
+  if (condition.op === "not") workflowConditionCollections(condition.condition, names);
+  else if (condition.op === "and" || condition.op === "or") condition.conditions.forEach((child) => workflowConditionCollections(child, names));
+  else if (condition.op === "list.contains" && condition.collection) names.add(condition.collection);
+}
 
 export async function publishInteractiveWorkflow(input: {
   jobId: string;
@@ -155,9 +164,9 @@ export async function updateInteractiveWorkflow(input: {
 async function workflowView(workflowId: string, guild: Guild, member?: GuildMember, inputs?: Record<string, string>, selected?: readonly string[]) {
   const entries: Record<string, number> = {};
   const spec = interactiveWorkflowSchema.parse((await db.select({ spec: interactiveWorkflows.spec }).from(interactiveWorkflows).where(eq(interactiveWorkflows.id, workflowId)).limit(1))[0]?.spec);
-  const collections = new Set<string>();
-  for (const trigger of spec.triggers) for (const step of trigger.steps) if (step.action === "entry.join" || step.action === "entry.leave") collections.add(step.collection);
-  for (const collection of collections) {
+  const entryCollectionNames = new Set<string>();
+  for (const trigger of spec.triggers) for (const step of trigger.steps) if (step.action === "entry.join" || step.action === "entry.leave") entryCollectionNames.add(step.collection);
+  for (const collection of entryCollectionNames) {
     const [count] = await db.select({ count: sql<number>`count(*)::int` }).from(workflowEntries).where(and(eq(workflowEntries.workflowId, workflowId), eq(workflowEntries.collection, collection)));
     entries[collection] = count?.count ?? 0;
   }
@@ -166,12 +175,24 @@ async function workflowView(workflowId: string, guild: Guild, member?: GuildMemb
     or(and(eq(workflowStates.scope, "workflow"), eq(workflowStates.scopeId, workflowId)), and(eq(workflowStates.scope, "guild"), eq(workflowStates.scopeId, guild.id)), ...(member ? [and(eq(workflowStates.scope, "member"), eq(workflowStates.scopeId, member.id))] : [])),
   ));
   const states = Object.fromEntries(stateRows.map((row) => [`${row.scope}:${row.key}`, row.value]));
+  const collections: Record<string, unknown[]> = {};
+  const usedCollectionNames = new Set<string>();
+  for (const component of spec.components) workflowConditionCollections(component.disabledWhen, usedCollectionNames);
+  for (const trigger of spec.triggers) for (const step of trigger.steps) workflowConditionCollections(step.when, usedCollectionNames);
+  if (usedCollectionNames.size) {
+    const collectionRows = await db.select({ scope: workflowCollections.scope, collection: workflowCollections.collection, item: workflowCollections.item }).from(workflowCollections).where(and(
+      eq(workflowCollections.workflowId, workflowId), inArray(workflowCollections.collection, [...usedCollectionNames]),
+      or(and(eq(workflowCollections.scope, "workflow"), eq(workflowCollections.scopeId, workflowId)), and(eq(workflowCollections.scope, "guild"), eq(workflowCollections.scopeId, guild.id)), ...(member ? [and(eq(workflowCollections.scope, "member"), eq(workflowCollections.scopeId, member.id))] : [])),
+    )).orderBy(workflowCollections.createdAt);
+    for (const row of collectionRows) (collections[`${row.scope}:${row.collection}`] ??= []).push(row.item);
+  }
   const permissions = new Set(workflowPermissionNames.filter((permission) => member?.permissions.has(PermissionFlagsBits[permission])));
   return {
     spec,
     view: {
       entries,
       states,
+      collections,
       roleNames: new Set(member?.roles.cache.map((role) => role.name) ?? []),
       permissions,
       ...(inputs ? { inputs } : {}),
@@ -192,7 +213,7 @@ async function refreshWorkflowPanel(workflow: WorkflowRecord, guild: Guild, memb
 
 function resolveTemplate(value: unknown, context: { entries: Record<string, number>; states: Record<string, unknown>; results?: Record<string, unknown>; inputs: Record<string, string>; selected: readonly string[]; actorId?: string }): unknown {
   if (typeof value !== "string") return value;
-  const exact = value.match(/^\{\{(state|input):([^}:]+)(?::([^}]+))?\}\}$/);
+  const exact = value.match(/^\{\{(state|input|result):([^}:]+)(?::([^}]+))?\}\}$/);
   if (exact?.[1] === "input") return context.inputs[exact[2]!] ?? "";
   if (exact?.[1] === "state") return context.states[`${exact[2]}:${exact[3] ?? ""}`] ?? null;
   if (exact?.[1] === "result") {
@@ -200,6 +221,36 @@ function resolveTemplate(value: unknown, context: { entries: Record<string, numb
     return result && typeof result === "object" ? (result as Record<string, unknown>)[exact[3]!] ?? null : null;
   }
   return renderWorkflowTemplate(value, context);
+}
+
+function scopedStateId(scope: "workflow" | "guild" | "member", workflow: WorkflowRecord, member?: GuildMember): string {
+  if (scope === "workflow") return workflow.id;
+  if (scope === "guild") return workflow.guildId;
+  if (!member) throw new Error("Member-scoped state requires an interaction member.");
+  return member.id;
+}
+
+function assertWritableStateKey(scope: "workflow" | "guild" | "member", key: string): void {
+  if (scope === "workflow" && (key === "active_giveaway_id" || key === "panel.description")) throw new Error(`State key is reserved by Autocord: ${key}`);
+}
+
+function resolvedNumber(value: number | string, context: Parameters<typeof resolveTemplate>[1]): number {
+  const resolved = resolveTemplate(value, context);
+  if (typeof resolved !== "number" || !Number.isFinite(resolved)) throw new Error("Math operand did not resolve to a finite number.");
+  return resolved;
+}
+
+function resolvedScalar(value: unknown, context: Parameters<typeof resolveTemplate>[1]): string | number | boolean | null {
+  const resolved = resolveTemplate(value, context);
+  if (resolved !== null && typeof resolved !== "string" && typeof resolved !== "number" && typeof resolved !== "boolean") throw new Error("Workflow value did not resolve to a scalar.");
+  if (typeof resolved === "number" && !Number.isFinite(resolved)) throw new Error("Workflow scalar number must be finite.");
+  if (typeof resolved === "string" && resolved.length > 1000) throw new Error("Workflow scalar string exceeds 1000 characters.");
+  return resolved;
+}
+
+function workflowCollectionLimit(): number {
+  const configured = Number(process.env.MAX_ITEMS_PER_WORKFLOW_COLLECTION ?? 1000);
+  return Number.isFinite(configured) ? Math.max(1, Math.min(10000, configured)) : 1000;
 }
 
 async function loadManagedRole(guildId: string, guild: Guild, roleName: string) {
@@ -311,11 +362,127 @@ async function executeWorkflowStep(workflow: WorkflowRecord, step: InteractiveWo
       return { left: removed.length > 0 };
     }
     case "state.set": {
-      if (step.scope === "member" && !member) throw new Error("Member-scoped state requires an interaction member.");
-      const value = resolveTemplate(step.value, templateContext);
-      const scopeId = step.scope === "workflow" ? workflow.id : step.scope === "guild" ? workflow.guildId : member!.id;
+      assertWritableStateKey(step.scope, step.key);
+      const value = resolvedScalar(step.value, templateContext);
+      const scopeId = scopedStateId(step.scope, workflow, member);
       await db.insert(workflowStates).values({ workflowId: workflow.id, scope: step.scope, scopeId, key: step.key, value, updatedAt: new Date() }).onConflictDoUpdate({ target: [workflowStates.workflowId, workflowStates.scope, workflowStates.scopeId, workflowStates.key], set: { value, updatedAt: new Date() } });
       return { key: step.key, scope: step.scope };
+    }
+    case "state.get": {
+      const scopeId = scopedStateId(step.scope, workflow, member);
+      const [row] = await db.select({ value: workflowStates.value }).from(workflowStates).where(and(eq(workflowStates.workflowId, workflow.id), eq(workflowStates.scope, step.scope), eq(workflowStates.scopeId, scopeId), eq(workflowStates.key, step.key))).limit(1);
+      return { exists: Boolean(row), value: row?.value ?? null };
+    }
+    case "state.increment":
+    case "state.decrement":
+    case "state.multiply": {
+      assertWritableStateKey(step.scope, step.key);
+      const scopeId = scopedStateId(step.scope, workflow, member);
+      const amount = resolvedNumber(step.action === "state.multiply" ? step.factor : step.amount, templateContext);
+      const next = await mutateWorkflowNumber({ workflowId: workflow.id, scope: step.scope, scopeId, key: step.key, operation: step.action.slice("state.".length) as "increment" | "decrement" | "multiply", amount });
+      return { key: step.key, value: next };
+    }
+    case "state.delete":
+    case "state.reset": {
+      const scopeId = scopedStateId(step.scope, workflow, member);
+      if (step.action === "state.delete") {
+        assertWritableStateKey(step.scope, step.key);
+        await db.delete(workflowStates).where(and(eq(workflowStates.workflowId, workflow.id), eq(workflowStates.scope, step.scope), eq(workflowStates.scopeId, scopeId), eq(workflowStates.key, step.key)));
+        return { deleted: true };
+      }
+      if (step.key === null) {
+        await db.delete(workflowStates).where(and(eq(workflowStates.workflowId, workflow.id), eq(workflowStates.scope, step.scope), eq(workflowStates.scopeId, scopeId), notInArray(workflowStates.key, ["active_giveaway_id", "panel.description"])));
+        return { reset: true, scope: step.scope };
+      }
+      assertWritableStateKey(step.scope, step.key);
+      const value = resolvedScalar(step.value, templateContext);
+      await db.insert(workflowStates).values({ workflowId: workflow.id, scope: step.scope, scopeId, key: step.key, value, updatedAt: new Date() }).onConflictDoUpdate({ target: [workflowStates.workflowId, workflowStates.scope, workflowStates.scopeId, workflowStates.key], set: { value, updatedAt: new Date() } });
+      return { reset: true, key: step.key };
+    }
+    case "state.append":
+    case "state.remove": {
+      assertWritableStateKey(step.scope, step.key);
+      const scopeId = scopedStateId(step.scope, workflow, member);
+      const value = resolvedScalar(step.value, templateContext);
+      const lockKey = `${workflow.id}:${step.scope}:${scopeId}:${step.key}`;
+      const result = await db.transaction(async (tx) => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
+        const [row] = await tx.select({ value: workflowStates.value }).from(workflowStates).where(and(eq(workflowStates.workflowId, workflow.id), eq(workflowStates.scope, step.scope), eq(workflowStates.scopeId, scopeId), eq(workflowStates.key, step.key))).limit(1);
+        const current = row?.value ?? [];
+        if (!Array.isArray(current)) throw new Error(`State ${step.key} is not a list.`);
+        if (step.action === "state.append" && current.length >= 1000) throw new Error("State list item limit reached (1000).");
+        const next = step.action === "state.append" ? [...current, value] : current.filter((item) => !Object.is(item, value));
+        await tx.insert(workflowStates).values({ workflowId: workflow.id, scope: step.scope, scopeId, key: step.key, value: next, updatedAt: new Date() }).onConflictDoUpdate({ target: [workflowStates.workflowId, workflowStates.scope, workflowStates.scopeId, workflowStates.key], set: { value: next, updatedAt: new Date() } });
+        return { count: next.length, changed: next.length !== current.length };
+      });
+      return result;
+    }
+    case "math.add":
+    case "math.subtract":
+    case "math.multiply":
+    case "math.divide": {
+      const left = resolvedNumber(step.left, templateContext);
+      const right = resolvedNumber(step.right, templateContext);
+      return { value: calculateBinaryMath(step.action, left, right) };
+    }
+    case "math.min":
+    case "math.max": {
+      const values = step.values.map((value) => resolvedNumber(value, templateContext));
+      return { value: calculateAggregateMath(step.action, values) };
+    }
+    case "math.clamp": {
+      const value = resolvedNumber(step.value, templateContext);
+      return { value: calculateClamp(value, step.min, step.max) };
+    }
+    case "random.integer": return { value: randomInt(step.min, step.max + 1) };
+    case "random.choice": return { value: step.values[randomInt(0, step.values.length)] };
+    case "random.weighted_choice": {
+      const total = step.options.reduce((sum, option) => sum + option.weight, 0);
+      return { value: selectWeighted(step.options, randomInt(total)) };
+    }
+    case "collection.add":
+    case "collection.remove":
+    case "collection.count":
+    case "collection.contains":
+    case "collection.list":
+    case "collection.rank":
+    case "collection.clear": {
+      const scopeId = scopedStateId(step.scope, workflow, member);
+      const base = and(eq(workflowCollections.workflowId, workflow.id), eq(workflowCollections.scope, step.scope), eq(workflowCollections.scopeId, scopeId), eq(workflowCollections.collection, step.collection));
+      if (step.action === "collection.add") {
+        const cap = Math.min(step.maxItems, workflowCollectionLimit());
+        const item = resolvedScalar(step.item, templateContext);
+        const added = await addWorkflowCollectionItem({
+          workflowId: workflow.id, guildId: workflow.guildId, scope: step.scope, scopeId, collection: step.collection, item, maxItems: cap,
+        });
+        return { added };
+      }
+      if (step.action === "collection.remove") {
+        const item = resolvedScalar(step.item, templateContext);
+        const removed = await db.delete(workflowCollections).where(and(base, eq(workflowCollections.itemKey, JSON.stringify(item)))).returning({ id: workflowCollections.id });
+        return { removed: removed.length > 0 };
+      }
+      if (step.action === "collection.clear") {
+        const removed = await db.delete(workflowCollections).where(base).returning({ id: workflowCollections.id });
+        return { removed: removed.length };
+      }
+      if (step.action === "collection.count") {
+        const [count] = await db.select({ count: sql<number>`count(*)::int` }).from(workflowCollections).where(base);
+        return { count: count?.count ?? 0 };
+      }
+      if (step.action === "collection.contains") {
+        const resolved = resolvedScalar(step.item, templateContext);
+        const [item] = await db.select({ id: workflowCollections.id }).from(workflowCollections).where(and(base, eq(workflowCollections.itemKey, JSON.stringify(resolved)))).limit(1);
+        return { contains: Boolean(item) };
+      }
+      const rows = await db.select({ item: workflowCollections.item }).from(workflowCollections).where(base).orderBy(workflowCollections.createdAt).limit(step.action === "collection.list" ? step.limit : 10000);
+      if (step.action === "collection.list") return { items: rows.map((row) => row.item) };
+      const values = rows.map((row) => row.item);
+      if (values.some((value) => typeof value !== "number" || !Number.isFinite(value))) throw new Error("collection.rank requires a collection of finite numeric values.");
+      const numericValues = values as number[];
+      const targetValue = resolvedNumber(step.value, templateContext);
+      const rank = 1 + numericValues.filter((value) => step.order === "desc" ? value > targetValue : value < targetValue).length;
+      return { rank, count: numericValues.length };
     }
     case "role.grant":
     case "role.revoke": {

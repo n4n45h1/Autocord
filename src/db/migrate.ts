@@ -141,6 +141,14 @@ try {
       scope text NOT NULL, scope_id text NOT NULL, key text NOT NULL, value jsonb NOT NULL,
       updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(workflow_id, scope, scope_id, key)
     );
+    CREATE TABLE IF NOT EXISTS workflow_collections (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, scope text NOT NULL, scope_id text NOT NULL,
+      collection text NOT NULL, item_key text NOT NULL, item jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(workflow_id, scope, scope_id, collection, item_key)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_collections_count_idx ON workflow_collections(workflow_id, scope, scope_id, collection, created_at);
     CREATE TABLE IF NOT EXISTS workflow_runs (
       id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
       guild_id text NOT NULL, interaction_id text NOT NULL, trigger_id text NOT NULL, actor_id text NOT NULL,

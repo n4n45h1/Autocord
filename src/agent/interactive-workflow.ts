@@ -2,33 +2,65 @@ import { z } from "zod";
 
 const key = z.string().regex(/^[a-z0-9._-]{1,40}$/);
 const scalar = z.union([z.string().max(1000), z.number(), z.boolean(), z.null()]);
+const finiteNumber = z.number().finite().min(-1_000_000_000_000).max(1_000_000_000_000);
+const numericOperand = z.union([finiteNumber, z.string().max(100)]);
 const conditionLeaf = z.discriminatedUnion("op", [
   z.object({ op: z.literal("entries.lt"), collection: key, value: z.number().int().min(0).max(1000) }).strict(),
   z.object({ op: z.literal("entries.gte"), collection: key, value: z.number().int().min(0).max(1000) }).strict(),
   z.object({ op: z.literal("state.equals"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
+  z.object({ op: z.enum(["number.eq", "number.gt", "number.gte", "number.lt", "number.lte"]), scope: z.enum(["workflow", "guild", "member"]), key, value: finiteNumber }).strict(),
+  z.object({ op: z.enum(["string.equals", "string.contains", "string.starts_with"]), scope: z.enum(["workflow", "guild", "member"]), key, value: z.string().max(1000) }).strict(),
+  z.object({ op: z.literal("list.contains"), scope: z.enum(["workflow", "guild", "member"]), key: key.optional(), collection: key.optional(), value: scalar }).strict().refine((condition) => Boolean(condition.key) !== Boolean(condition.collection), "list.contains requires exactly one of key or collection"),
   z.object({ op: z.literal("state.exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ op: z.literal("state.not_exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ op: z.literal("member.has_role"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ op: z.literal("member.has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "Administrator"]) }).strict(),
   z.object({ op: z.literal("time.within"), startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict().refine((condition) => Date.parse(condition.endAt) > Date.parse(condition.startAt), "time.within endAt must follow startAt"),
+  z.object({ op: z.literal("random.chance"), percent: z.number().min(0).max(100) }).strict(),
   z.object({ op: z.literal("result.equals"), stepId: key, field: key, value: scalar }).strict(),
   z.object({ op: z.literal("voice.members.gte"), value: z.number().int().min(1).max(99) }).strict(),
   z.object({ op: z.literal("voice.members.eq"), value: z.number().int().min(0).max(99) }).strict(),
   z.object({ op: z.literal("voice.session.exists") }).strict(),
 ]);
 
-export const workflowConditionSchema = z.union([
+type ConditionLeaf = z.infer<typeof conditionLeaf>;
+export type WorkflowCondition = ConditionLeaf | { op: "and" | "or"; conditions: WorkflowCondition[] } | { op: "not"; condition: WorkflowCondition };
+const conditionNode: z.ZodType<WorkflowCondition> = z.lazy(() => z.union([
   conditionLeaf,
-  z.object({ op: z.enum(["and", "or"]), conditions: z.array(conditionLeaf).min(2).max(8) }).strict(),
-]);
+  z.object({ op: z.enum(["and", "or"]), conditions: z.array(conditionNode).min(2).max(8) }).strict(),
+  z.object({ op: z.literal("not"), condition: conditionNode }).strict(),
+]));
+
+export const workflowConditionSchema = conditionNode.superRefine((condition, ctx) => {
+  let nodes = 0;
+  const visit = (current: WorkflowCondition, depth: number) => {
+    nodes++;
+    if (depth > 8) ctx.addIssue({ code: "custom", message: "Condition nesting limit is 8." });
+    if (nodes > 64) return;
+    if (current.op === "not") visit(current.condition, depth + 1);
+    else if (current.op === "and" || current.op === "or") current.conditions.forEach((child) => visit(child, depth + 1));
+  };
+  visit(condition, 1);
+  if (nodes > 64) ctx.addIssue({ code: "custom", message: "Condition node limit is 64." });
+});
+
+function conditionLeaves(condition?: WorkflowCondition): ConditionLeaf[] {
+  if (!condition) return [];
+  if (condition.op === "not") return conditionLeaves(condition.condition);
+  if (condition.op === "and" || condition.op === "or") return condition.conditions.flatMap(conditionLeaves);
+  return [condition as ConditionLeaf];
+}
 
 function conditionUsesVoice(condition: WorkflowCondition): boolean {
-  return condition.op === "voice.members.gte" || condition.op === "voice.members.eq" || condition.op === "voice.session.exists"
-    || ((condition.op === "and" || condition.op === "or") && condition.conditions.some(conditionUsesVoice));
+  return conditionLeaves(condition).some((leaf) => leaf.op === "voice.members.gte" || leaf.op === "voice.members.eq" || leaf.op === "voice.session.exists");
 }
 
 function conditionsOf(condition?: WorkflowCondition) {
-  return !condition ? [] : condition.op === "and" || condition.op === "or" ? condition.conditions : [condition];
+  return conditionLeaves(condition);
+}
+
+function conditionUsesMember(condition: WorkflowCondition): boolean {
+  return conditionLeaves(condition).some((leaf) => leaf.op === "member.has_role" || leaf.op === "member.has_permission");
 }
 
 const stepBase = { id: key, dependsOn: z.array(key).max(12).default([]), when: workflowConditionSchema.optional() };
@@ -36,6 +68,14 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("entry.join"), collection: key, maxEntries: z.number().int().min(1).max(1000) }).strict(),
   z.object({ ...stepBase, action: z.literal("entry.leave"), collection: key }).strict(),
   z.object({ ...stepBase, action: z.literal("state.set"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.get"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.increment"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.decrement"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.multiply"), scope: z.enum(["workflow", "guild", "member"]), key, factor: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.delete"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.reset"), scope: z.enum(["workflow", "guild", "member"]), key: key.nullable(), value: scalar.default(null) }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.append"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.remove"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
   z.object({ ...stepBase, action: z.literal("role.grant"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("role.revoke"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("message.send"), delivery: z.enum(["workflow_channel", "workflow_owner_dm"]).default("workflow_channel"), content: z.string().min(1).max(1900) }).strict(),
@@ -53,6 +93,23 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("giveaway.pause"), giveawayId: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("giveaway.resume"), giveawayId: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("giveaway.reroll"), giveawayId: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.add"), left: numericOperand, right: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.subtract"), left: numericOperand, right: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.multiply"), left: numericOperand, right: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.divide"), left: numericOperand, right: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.min"), values: z.array(numericOperand).min(1).max(25) }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.max"), values: z.array(numericOperand).min(1).max(25) }).strict(),
+  z.object({ ...stepBase, action: z.literal("math.clamp"), value: numericOperand, min: finiteNumber, max: finiteNumber }).strict().refine((step) => step.max >= step.min, "math.clamp max must be >= min"),
+  z.object({ ...stepBase, action: z.literal("random.integer"), min: z.number().int().min(-1_000_000_000).max(1_000_000_000), max: z.number().int().min(-1_000_000_000).max(1_000_000_000) }).strict().refine((step) => step.max >= step.min, "random.integer max must be >= min"),
+  z.object({ ...stepBase, action: z.literal("random.choice"), values: z.array(scalar).min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("random.weighted_choice"), options: z.array(z.object({ value: scalar, weight: z.number().int().min(1).max(1_000_000) }).strict()).min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.add"), scope: z.enum(["workflow", "guild", "member"]), collection: key, item: scalar, maxItems: z.number().int().min(1).max(10000).default(1000) }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.remove"), scope: z.enum(["workflow", "guild", "member"]), collection: key, item: scalar }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.count"), scope: z.enum(["workflow", "guild", "member"]), collection: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.contains"), scope: z.enum(["workflow", "guild", "member"]), collection: key, item: scalar }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.list"), scope: z.enum(["workflow", "guild", "member"]), collection: key, limit: z.number().int().min(1).max(100).default(50) }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.rank"), scope: z.enum(["workflow", "guild", "member"]), collection: key, value: numericOperand, order: z.enum(["asc", "desc"]).default("desc") }).strict(),
+  z.object({ ...stepBase, action: z.literal("collection.clear"), scope: z.enum(["workflow", "guild", "member"]), collection: key }).strict(),
 ]);
 
 const buttonComponent = z.object({ key, kind: z.literal("button"), label: z.string().min(1).max(80), style: z.enum(["primary", "secondary", "success", "danger"]), emoji: z.string().max(64).nullable(), disabledWhen: workflowConditionSchema.nullable().optional(), triggerId: key }).strict();
@@ -122,11 +179,9 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       if (createdRole && !dependsOnAncestor(step.id, createdRole.id)) ctx.addIssue({ code: "custom", message: `Role operation ${step.id} must depend on Workflow role creation step ${createdRole.id}.` });
     }
     for (const step of trigger.steps) {
-      const text = step.action === "state.set" && typeof step.value === "string" ? step.value
-        : step.action === "message.send" || step.action === "message.edit" ? step.content
-          : "giveawayId" in step ? step.giveawayId : "";
+      const text = Object.values(step).filter((value): value is string => typeof value === "string").join("\n");
       for (const match of text.matchAll(/\{\{result:([a-z0-9._-]{1,40}):[a-z0-9._-]{1,40}\}\}/g)) requireResultDependency(step.id, match[1]!, `Step ${step.id}`);
-      const conditions = step.when ? step.when.op === "and" || step.when.op === "or" ? step.when.conditions : [step.when] : [];
+      const conditions = conditionsOf(step.when);
       for (const condition of conditions) if (condition.op === "result.equals") requireResultDependency(step.id, condition.stepId, `Condition on ${step.id}`);
     }
     const pending = new Set(trigger.steps.map((step) => step.id));
@@ -138,7 +193,7 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       }
       for (const step of ready) pending.delete(step.id);
     }
-    const panelMutationSteps = trigger.steps.filter((step) => ["entry.join", "entry.leave", "state.set", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
+    const panelMutationSteps = trigger.steps.filter((step) => step.action.startsWith("state.") || step.action.startsWith("collection.") || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
     if (panelMutationSteps.length) {
       const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
       if (!refresh) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} must refresh its UI after changing Workflow-visible state/resources.` });
@@ -147,9 +202,9 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
     if (trigger.event === "schedule" || trigger.event === "deadline") {
       for (const step of trigger.steps) {
         if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke" || step.action === "voice.channel.create" || step.action === "voice.channel.delete" || step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway.")) ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member/resource action ${step.action}.` });
-        if (step.action === "state.set" && step.scope === "member") ctx.addIssue({ code: "custom", message: "Scheduled triggers may not update member-scoped state." });
+        if ((step.action.startsWith("state.") || step.action.startsWith("collection.")) && "scope" in step && step.scope === "member") ctx.addIssue({ code: "custom", message: "Scheduled triggers may not access member-scoped state or collections." });
         if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate VoiceState conditions." });
-        if (step.when?.op === "member.has_role" || step.when?.op === "member.has_permission" || ((step.when?.op === "and" || step.when?.op === "or") && step.when.conditions.some((condition) => condition.op === "member.has_role" || condition.op === "member.has_permission"))) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate member-only conditions." });
+        if (step.when && conditionLeaves(step.when).some((condition) => condition.op === "member.has_role" || condition.op === "member.has_permission" || ("scope" in condition && condition.scope === "member"))) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate member-only conditions or member-scoped data." });
       }
       continue;
     }
@@ -169,7 +224,7 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
           : step.action === "giveaway.create" || step.action === "giveaway.end" || step.action === "giveaway.reroll" || step.action === "giveaway.pause" || step.action === "giveaway.resume" ? "ManageRoles"
           : null;
       if (requiredPermission) {
-        const conditions = conditionsOf(step.when);
+        const conditions = step.when?.op === "and" ? step.when.conditions : [];
         if (step.when?.op !== "and") ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must use an AND permission guard.` });
         if (!conditions.some((condition) => condition.op === "member.has_permission" && condition.permission === "ManageGuild")) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with member.has_permission ManageGuild.` });
         if (!conditions.some((condition) => condition.op === "member.has_permission" && condition.permission === requiredPermission)) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with member.has_permission ${requiredPermission}.` });
@@ -212,7 +267,6 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
 });
 
 export type InteractiveWorkflow = z.infer<typeof interactiveWorkflowSchema>;
-export type WorkflowCondition = z.infer<typeof workflowConditionSchema>;
 export type InteractiveWorkflowTrigger = InteractiveWorkflow["triggers"][number];
 export type InteractiveWorkflowStep = InteractiveWorkflowTrigger["steps"][number];
 export type WorkflowComponent = InteractiveWorkflow["components"][number];
@@ -222,7 +276,7 @@ export function compileInteractiveWorkflow(input: unknown): InteractiveWorkflow 
   const compiled = structuredClone(workflow);
   const collections = new Set<string>();
   for (const trigger of compiled.triggers) {
-    const mutationStepIds = trigger.steps.filter((step) => ["entry.join", "entry.leave", "state.set", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
+    const mutationStepIds = trigger.steps.filter((step) => step.action.startsWith("state.") || step.action.startsWith("collection.") || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
     for (const step of trigger.steps) if (step.action === "entry.join" || step.action === "entry.leave") collections.add(step.collection);
     const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
     if (refresh) refresh.dependsOn = [...new Set([...refresh.dependsOn, ...mutationStepIds])];

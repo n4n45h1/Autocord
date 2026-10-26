@@ -31,6 +31,15 @@ GitHub's `Other` metadata is not a license grant by itself. For those monorepos,
 - Existing panel state and revision snapshots are guild-scoped; no general chat transcript is sent to the model. Model/token/cost aggregates are stored per guild/job. Full prompt/response tracing is deliberately not enabled by default.
 - Components V2 and Classic rendering are separate renderers. Discord's sticky V2 message flag is respected; existing panels cannot switch render modes after publication.
 
+## v0.5 Phase 1 Core Workflow Addendum
+
+- `interactiveWorkflowStepSchema` is the executable action allowlist. Phase 1 registers State get/set/increment/decrement/multiply/delete/reset/append/remove, Math add/subtract/multiply/divide/min/max/clamp, cryptographic Random integer/choice/weighted-choice, and persistent Collection add/remove/count/contains/list/rank/clear actions as Agent Skills and interpreter cases.
+- State rows remain keyed by `(workflow_id, scope, scope_id, key)`. Numeric mutations use a PostgreSQL transaction advisory lock scoped to the full key, read/validate/update in one transaction, and enforce finite numeric bounds. Append/remove use the same key lock and a 1,000-item list cap.
+- `workflow_collections` is guild-bound and references its owning Workflow with cascade cleanup. A unique `(workflow,scope,scope_id,collection,item_key)` index provides idempotent membership; a count index supports scoped reads. Adds serialize per Workflow and enforce configurable per-collection capacity, a 20,000-row Workflow cap, and an approximately 10 MiB item-payload cap. Scalar items only; rank is numeric-only.
+- Conditions are a recursive declarative Zod DSL with depth 8 and 64-node bounds; no JavaScript execution is introduced. Numeric/string/state/list/role/permission/time/random/result leaves are composed through AND/OR/NOT. The Workflow interpreter resolves typed prior-step numeric results before arithmetic/state operations.
+- PostgreSQL concurrency and capacity tests are in `src/features/workflows/data.integration.test.ts`; they execute only when `TEST_DATABASE_URL` is present. Unit coverage checks schema, nested conditions, and deterministic math/weighted selection. Database availability and live Discord execution still need independent verification.
+- This is Phase 1, not the complete v0.5 scope. Expanded Discord message/channel/role operations, new Gateway event families, durable delay/branch/loop/cancel/retry control, broad structured requirement extraction, and scenarios A-F remain unimplemented until subsequent phases.
+
 ## Patterns Not Adopted
 
 - No `eval`, shell, arbitrary HTTP, arbitrary SQL or model-selected Discord route is available. Some reference bots expose these, or load skill code from GitHub; those mechanisms were rejected as incompatible with the closed executor boundary.
@@ -71,7 +80,7 @@ The bounded same-panel workflow and role/channel-create workflow execute end to 
 
 ## Remaining Review Items
 
-- Current skill registry covers panel create/edit, role create, channel category/text create and giveaway slash operations; channel/role edits, panel deletion and AI-produced giveaway plans are not registered capabilities.
+- Current Skill registry additionally includes the Phase 1 generic Workflow core actions. Expanded Discord message/channel/role operations, channel/role edits, panel deletion and the v0.5 scenario-specific planners are not registered capabilities.
 - `RECOVERY_REQUIRED` jobs fail closed for that guild and require operator reconciliation; Discord state is not automatically guessed after an ambiguous network outcome.
 - Outbox retries and database migrations are unit/type checked but have not been tested with injected PostgreSQL/Discord failures in CI. No test-guild end-to-end operation was performed as part of this source review.
 - Long-term retention/deletion controls and model price snapshots need a separate product/privacy decision before broader rollout.

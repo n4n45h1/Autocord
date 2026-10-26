@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { MessageFlags } from "discord.js";
-import { compileInteractiveWorkflow, interactiveWorkflowSchema, orderInteractiveWorkflowSteps } from "../../agent/interactive-workflow.js";
+import { compileInteractiveWorkflow, interactiveWorkflowSchema, interactiveWorkflowStepSchema, workflowConditionSchema, orderInteractiveWorkflowSteps, type WorkflowCondition } from "../../agent/interactive-workflow.js";
+import { agentSkills } from "../../agent/skills/registry.js";
 import { analyzeRequestRequirements, validatePlanTargetAgainstRequest, validateWorkflowAgainstRequest } from "../../agent/requirements.js";
 import { evaluateWorkflowCondition, renderWorkflowTemplate } from "./conditions.js";
 import { renderInteractiveWorkflow } from "./render.js";
+import { calculateAggregateMath, calculateBinaryMath, calculateClamp, selectWeighted } from "./math.js";
 
 const signup = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/valorant-recruitment.json", import.meta.url), "utf8")));
 const onboarding = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/onboarding-consent.json", import.meta.url), "utf8")));
@@ -12,6 +14,62 @@ const voiceSession = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL(
 const resourcesAndGiveaway = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/resources-and-giveaway.json", import.meta.url), "utf8")));
 
 describe("generic interactive Workflow definitions", () => {
+  it("registers typed state, math, random, and collection actions and evaluates nested conditions", () => {
+    const actions = [
+      { id: "inc", action: "state.increment", scope: "member", key: "points", amount: 100 },
+      { id: "math", action: "math.add", left: "{{state:member:points}}", right: 50 },
+      { id: "roll", action: "random.weighted_choice", options: [{ value: "warrior", weight: 3 }, { value: "mage", weight: 1 }] },
+      { id: "add", action: "collection.add", scope: "member", collection: "inventory", item: "potion", maxItems: 100 },
+    ];
+    for (const action of actions) expect(interactiveWorkflowStepSchema.safeParse({ ...action, dependsOn: [] }).success).toBe(true);
+    for (const id of ["workflow.state.increment", "workflow.math.add", "workflow.random.weighted_choice", "workflow.collection.add"]) {
+      expect(Object.hasOwn(agentSkills, id)).toBe(true);
+    }
+    const context = { entries: {}, states: { "member:points": 550 }, collections: { "member:inventory": ["potion"] }, roleNames: new Set<string>(), permissions: new Set<string>() };
+    const nested: WorkflowCondition = { op: "and", conditions: [
+      { op: "number.gte", scope: "member", key: "points", value: 500 },
+      { op: "not", condition: { op: "string.equals", scope: "member", key: "class", value: "none" } },
+      { op: "list.contains", scope: "member", collection: "inventory", value: "potion" },
+    ] };
+    expect(workflowConditionSchema.safeParse(nested).success).toBe(true);
+    expect(evaluateWorkflowCondition(nested, context)).toBe(true);
+    expect(evaluateWorkflowCondition({ op: "random.chance", percent: 100 }, context)).toBe(true);
+    expect(evaluateWorkflowCondition({ op: "random.chance", percent: 0 }, context)).toBe(false);
+    const tooDeep = Array.from({ length: 9 }, () => ({ op: "not", condition: null })).reduceRight((child, parent) => ({ ...parent, condition: child }), { op: "state.exists", scope: "workflow", key: "x" } as unknown);
+    expect(workflowConditionSchema.safeParse(tooDeep).success).toBe(false);
+  });
+
+  it("evaluates bounded arithmetic and weighted random selection without an LLM", () => {
+    expect(calculateBinaryMath("math.add", 12, 3)).toBe(15);
+    expect(calculateBinaryMath("math.subtract", 12, 3)).toBe(9);
+    expect(calculateBinaryMath("math.multiply", 12, 3)).toBe(36);
+    expect(calculateBinaryMath("math.divide", 12, 3)).toBe(4);
+    expect(() => calculateBinaryMath("math.divide", 1, 0)).toThrow(/zero/);
+    expect(calculateAggregateMath("math.min", [7, 2, 5])).toBe(2);
+    expect(calculateAggregateMath("math.max", [7, 2, 5])).toBe(7);
+    expect(calculateClamp(15, 0, 10)).toBe(10);
+    expect(selectWeighted([{ value: "warrior", weight: 3 }, { value: "mage", weight: 1 }], 3)).toBe("mage");
+  });
+
+  it("keeps requested scenarios A-F distinct from currently executable primitives", () => {
+    const scenarios = [
+      ["A", "ユーザーがイベントに参加すると100ポイント付与。500ポイントで景品交換できるようにして", "workflow.atomic_conditional_debit_and_redemption"],
+      ["B", "戦士・魔法使い・僧侶が選べるRPG。HP、攻撃力、経験値、レベル、ゴールド、戦闘とショップ", "workflow.turn_based_game_loop_and_transactional_shop"],
+      ["C", "問い合わせボタンからフォームを開き、スタッフだけが確認できる専用チャンネルを作って", "channel.private_ticket_permission_preset_and_close_lifecycle"],
+      ["E", "提案に賛成が20票集まったら管理者に通知して。1人1票まで", "trigger.reaction_added_and_atomic_unique_vote_threshold"],
+      ["F", "毎週土曜日にイベントを開催し、終了後にランキングをリセット", "schedule.at_timezone_and_weekly_calendar_trigger"],
+    ] as const;
+    for (const [name, request, missingSkill] of scenarios) {
+      expect(analyzeRequestRequirements(request).unsupportedSkills, `scenario ${name}`).toContain(missingSkill);
+    }
+    const voiceLobby = analyzeRequestRequirements("VALORANT募集で5人集まったら専用VCを作成し、メンバーが退出したら自動削除して");
+    expect(voiceLobby.voiceRequested).toBe(true);
+    expect(voiceLobby.voiceThreshold).toBe(5);
+    expect(voiceLobby.unsupportedSkills).not.toContain("workflow.button_signup_to_voice_session_membership");
+    const buttonSignup = analyzeRequestRequirements("参加ボタンで5人集まったら専用VCを作成して");
+    expect(buttonSignup.unsupportedSkills).toContain("workflow.button_signup_to_voice_session_membership");
+  });
+
   it("accepts the recruitment UI/actions without feature-specific schema branches", () => {
     expect(signup.triggers.flatMap((trigger) => trigger.steps).map((step) => step.action)).toEqual(["entry.join", "panel.refresh", "entry.leave", "panel.refresh"]);
   });

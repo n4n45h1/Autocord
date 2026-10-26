@@ -34,11 +34,19 @@ export function analyzeRequestRequirements(instruction: string): RequestRequirem
   const recruitmentCap = participantRequest && participantLimit ? Number(participantLimit[1] ?? participantLimit[2]) : null;
   const validRecruitmentCap = Number.isInteger(recruitmentCap) && recruitmentCap! > 0 ? recruitmentCap : null;
   const unifiedResourceInteraction = resourceCreate && /workflow|interactive|ボタン|panel|フォーム|同意|募集|give\s*away|懸賞/i.test(instruction);
+  const unsupportedSkills: string[] = [];
+  if (/ポイント|points/i.test(instruction) && /交換|redeem|redemption/i.test(instruction)) unsupportedSkills.push("workflow.atomic_conditional_debit_and_redemption");
+  if (/\brpg\b|戦士|魔法使い|僧侶/i.test(instruction) && /戦闘|バトル|ショップ|経験値|攻撃力/i.test(instruction)) unsupportedSkills.push("workflow.turn_based_game_loop_and_transactional_shop");
+  if (/チケット|問い合わせ|inquiry/i.test(instruction) && /専用チャンネル|スタッフだけ|private\s*channel/i.test(instruction)) unsupportedSkills.push("channel.private_ticket_permission_preset_and_close_lifecycle");
+  if (/(?:賛成|賛成票|vote|votes).{0,30}\d{1,3}\s*票|\d{1,3}\s*票.{0,30}(?:賛成|vote)/i.test(instruction)) unsupportedSkills.push("trigger.reaction_added_and_atomic_unique_vote_threshold");
+  if (/毎週.{0,8}土曜|毎週.{0,8}土曜日|every\s+saturday/i.test(instruction)) unsupportedSkills.push("schedule.at_timezone_and_weekly_calendar_trigger");
+  if (voiceRequested && /ボタン.{0,12}参加|参加.{0,12}ボタン|button.{0,20}join/i.test(instruction)) unsupportedSkills.push("workflow.button_signup_to_voice_session_membership");
   const requiredCapabilities = [
     ...(contactForm ? ["ui.modal", "trigger.modal_submit", "state.member.write", "notification.owner_dm"] : []),
     ...(giveawayRequested ? ["giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.draw_and_notify"] : []),
     ...(validRecruitmentCap !== null ? ["trigger.button", "entry.unique", "entry.capacity", "entry.cancel", "panel.refresh"] : []),
     ...(voiceRequested ? ["voice.member_join_event", "voice.channel.create", "voice.member_leave_event", "voice.channel.delete"] : []),
+    ...unsupportedSkills,
     ...(resourceRoleCreate ? ["resource.role.create"] : []),
     ...(resourceCategoryCreate ? ["resource.channel.create_category"] : []),
     ...(resourceTextChannelCreate ? ["resource.channel.create_text"] : []),
@@ -53,7 +61,7 @@ export function analyzeRequestRequirements(instruction: string): RequestRequirem
     ...(resourceTextChannelCreate ? ["create a default-permission text channel"] : []),
   ];
   return {
-    complex: contactForm || giveawayRequested || voiceRequested || validRecruitmentCap !== null || resourceCreate || /schedule|定期|期限|modal|フォーム|ワークフロー/i.test(instruction),
+    complex: contactForm || giveawayRequested || voiceRequested || validRecruitmentCap !== null || resourceCreate || unsupportedSkills.length > 0 || /schedule|定期|期限|modal|フォーム|ワークフロー/i.test(instruction),
     contactForm,
     giveawayRequested,
     recruitmentCap: validRecruitmentCap,
@@ -66,7 +74,7 @@ export function analyzeRequestRequirements(instruction: string): RequestRequirem
     voiceThreshold: Number.isInteger(voiceThreshold) && voiceThreshold! > 0 ? voiceThreshold : null,
     requiredCapabilities,
     expectedEffects,
-    unsupportedSkills: [],
+    unsupportedSkills: [...new Set(unsupportedSkills)],
   };
 }
 

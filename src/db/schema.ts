@@ -208,6 +208,18 @@ export const workflowStates = pgTable("workflow_states", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [primaryKey({ columns: [table.workflowId, table.scope, table.scopeId, table.key] })]);
 
+export const workflowCollections = pgTable("workflow_collections", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  scope: text("scope").notNull(),
+  scopeId: text("scope_id").notNull(),
+  collection: text("collection").notNull(),
+  itemKey: text("item_key").notNull(),
+  item: jsonb("item").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("workflow_collections_item_idx").on(table.workflowId, table.scope, table.scopeId, table.collection, table.itemKey), index("workflow_collections_count_idx").on(table.workflowId, table.scope, table.scopeId, table.collection, table.createdAt)]);
+
 export const workflowRuns = pgTable("workflow_runs", {
   id: text("id").primaryKey(),
   workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
