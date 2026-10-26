@@ -40,7 +40,7 @@ try {
     CREATE INDEX IF NOT EXISTS panels_guild_updated_idx ON panels(guild_id, updated_at);
     UPDATE panels AS p SET spec = jsonb_build_object(
       'intent', 'edit', 'panelId', p.id, 'expectedRevision', p.revision,
-      'title', p.title, 'description', p.description, 'color', p.color,
+      'title', p.title, 'description', p.description, 'color', p.color, 'renderMode', 'classic',
       'selectionMode', 'multiple', 'componentStyle', 'select',
       'channelId', coalesce(p.spec->'channelId', 'null'::jsonb),
       'options', coalesce((
@@ -91,6 +91,15 @@ try {
       user_id text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
       PRIMARY KEY(giveaway_id, user_id)
     );
+    CREATE TABLE IF NOT EXISTS giveaway_notifications (
+      id text PRIMARY KEY, giveaway_id text NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, channel_id text NOT NULL, content text NOT NULL,
+      allowed_users jsonb NOT NULL, state text NOT NULL DEFAULT 'PENDING', attempts integer NOT NULL DEFAULT 0,
+      available_at timestamptz NOT NULL DEFAULT now(), lease_owner text, lease_expires_at timestamptz,
+      sent_at timestamptz, last_error text, created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS giveaway_notifications_due_idx ON giveaway_notifications(state, available_at);
+    CREATE INDEX IF NOT EXISTS giveaway_notifications_guild_idx ON giveaway_notifications(guild_id);
     ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS remaining_seconds integer;
     CREATE TABLE IF NOT EXISTS runtime_leases (
       guild_id text PRIMARY KEY, job_id text NOT NULL, owner text NOT NULL, expires_at timestamptz NOT NULL

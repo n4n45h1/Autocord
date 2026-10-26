@@ -1,6 +1,6 @@
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { agentJobs } from "../db/schema.js";
+import { agentJobs, usageRecords } from "../db/schema.js";
 import { db, pool } from "../db/client.js";
 
 export async function claimApproval(jobId: string, guildId: string, actorId: string): Promise<string | null> {
@@ -30,5 +30,10 @@ export async function recoverExpiredExecutionLeases(): Promise<number> {
     .where(and(eq(agentJobs.state, "AWAITING_APPROVAL"), sql`${agentJobs.expiresAt} < now()`));
   await db.update(agentJobs).set({ state: "EXPIRED", updatedAt: new Date() })
     .where(and(eq(agentJobs.state, "AWAITING_PANEL_SELECTION"), sql`${agentJobs.expiresAt} < now()`));
-  return recovered.length;
+  const expiredPlanning = await db.update(agentJobs).set({ state: "FAILED", errorDetail: { reason: "planning worker stopped before preview" }, updatedAt: new Date() })
+    .where(and(eq(agentJobs.state, "PLANNING"), or(isNull(agentJobs.expiresAt), sql`${agentJobs.expiresAt} < now()`))).returning({ id: agentJobs.id });
+  if (expiredPlanning.length) {
+    await db.update(usageRecords).set({ model: "failed" }).where(and(inArray(usageRecords.jobId, expiredPlanning.map(({ id }) => id)), eq(usageRecords.model, "pending")));
+  }
+  return recovered.length + expiredPlanning.length;
 }

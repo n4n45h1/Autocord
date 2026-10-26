@@ -1,7 +1,8 @@
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { db } from "../../db/client.js";
 import { agentJobs, guildSettings, usageRecords } from "../../db/schema.js";
+import { globalAiSlotStates } from "../../jobs/state.js";
 
 export type UsageReservation = { id: string; period: string };
 
@@ -19,7 +20,7 @@ export async function reserveUsage(guildId: string, userId: string, jobId: strin
     const [settings] = await tx.select().from(guildSettings).where(eq(guildSettings.guildId, guildId)).limit(1);
     const active = await tx.select({ count: sql<number>`count(*)::int` }).from(agentJobs).where(and(eq(agentJobs.guildId, guildId), sql`${agentJobs.state} IN ('PLANNING', 'AWAITING_PANEL_SELECTION', 'AWAITING_APPROVAL', 'EXECUTING', 'RECOVERY_REQUIRED')`));
     if ((active[0]?.count ?? 0) >= Number(process.env.MAX_CONCURRENT_JOBS_PER_GUILD ?? 1)) throw new Error("このサーバーでは別のAgentcordジョブが進行中、または復旧確認待ちです。");
-    const globalActive = await tx.select({ count: sql<number>`count(*)::int` }).from(agentJobs).where(sql`${agentJobs.state} IN ('PLANNING', 'AWAITING_PANEL_SELECTION', 'AWAITING_APPROVAL', 'EXECUTING', 'RECOVERY_REQUIRED')`);
+    const globalActive = await tx.select({ count: sql<number>`count(*)::int` }).from(agentJobs).where(inArray(agentJobs.state, globalAiSlotStates));
     if ((globalActive[0]?.count ?? 0) >= Number(process.env.MAX_CONCURRENT_AI_JOBS ?? 5)) throw new Error("Autocord全体のAI処理が混雑しています。少し待ってから再度お試しください。");
     const limit = mode === "mini" ? settings!.miniMonthlyLimit : settings!.maxMonthlyLimit;
     const used = await tx.select({ count: sql<number>`count(*)::int` }).from(usageRecords).where(and(eq(usageRecords.guildId, guildId), eq(usageRecords.period, period), eq(usageRecords.mode, mode)));

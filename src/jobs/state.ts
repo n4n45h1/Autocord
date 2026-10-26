@@ -1,5 +1,10 @@
 export const jobStates = ["PLANNING", "AWAITING_PANEL_SELECTION", "AWAITING_APPROVAL", "EXECUTING", "COMPLETED", "DENIED", "EXPIRED", "FAILED", "RECOVERY_REQUIRED"] as const;
 export type JobState = typeof jobStates[number];
+export const globalAiSlotStates = ["PLANNING"] as const;
+
+export function occupiesGlobalAiSlot(state: string): boolean {
+  return (globalAiSlotStates as readonly string[]).includes(state);
+}
 
 export function canTransition(from: JobState, to: JobState): boolean {
   const transitions: Record<JobState, JobState[]> = {

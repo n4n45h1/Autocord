@@ -8,6 +8,7 @@ export const panelPlanSchema = z.object({
   title: z.string().min(1).max(80),
   description: z.string().max(1000),
   color: z.enum(["blue", "purple", "green", "red", "gray"]),
+  renderMode: z.enum(["classic", "components_v2"]).default("components_v2"),
   selectionMode: z.enum(["single", "multiple"]),
   componentStyle: z.enum(["select", "buttons"]),
   channelId: z.string().max(30).nullable(),

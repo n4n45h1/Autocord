@@ -2,24 +2,24 @@ import "dotenv/config";
 import { createHash, randomInt, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, Events,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Events,
   GatewayIntentBits, PermissionFlagsBits, StringSelectMenuBuilder,
   type ChatInputCommandInteraction, type GuildMember, type InteractionReplyOptions, type MessageCreateOptions, type Role,
 } from "discord.js";
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt, lte, or, sql } from "drizzle-orm";
 import { db, pool } from "./db/client.js";
-import { agentJobs, auditEvents, giveaways, giveawayEntries, guildSettings, managedRoles, panelOptions, panelRevisions, panels, usageRecords } from "./db/schema.js";
+import { agentJobs, auditEvents, giveaways, giveawayEntries, giveawayNotifications, guildSettings, managedRoles, panelOptions, panelRevisions, panels, usageRecords } from "./db/schema.js";
 import { makePlan, type AgentMode } from "./agent/planner.js";
 import { panelPlanSchema, type PanelPlan } from "./agent/plan.js";
 import { failUsageReservation, finishUsage, reserveUsage, type UsageReservation } from "./agent/core/usage.js";
 import { assertDistributableRole, assertPolicy, isExpectedRevision } from "./policy.js";
 import { claimApproval, recoverExpiredExecutionLeases, withGuildAdvisoryLock } from "./jobs/claim.js";
 import { commands } from "./discord/commands.js";
-import { drawWinners } from "./features/giveaways/draw.js";
+import { drawWinners, giveawayNotificationRetryDelayMs, giveawayResultMessage } from "./features/giveaways/draw.js";
+import { renderPanel } from "./features/panels/render.js";
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const workerId = randomUUID();
-const panelColors = { blue: 0x3498db, purple: 0x9b59b6, green: 0x2ecc71, red: 0xe74c3c, gray: 0x95a5a6 } as const;
 const adminPerms = [PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles];
 
 function requireAdmin(member: GuildMember): void {
@@ -40,27 +40,13 @@ function stablePanelPlan(plan: PanelPlan, panelId: string, revision: number): Pa
   return { ...plan, intent: "edit", panelId, expectedRevision: revision };
 }
 
-function renderPanel(plan: PanelPlan, panelId: string): MessageCreateOptions {
-  const embed = new EmbedBuilder().setColor(panelColors[plan.color]).setTitle(plan.title).setDescription(plan.description || "ロールを選択してください。");
-  const components = plan.componentStyle === "select"
-    ? [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(new StringSelectMenuBuilder()
-      .setCustomId(`rolepanel:${panelId}`).setPlaceholder("付与するロールを選択")
-      .setMinValues(0).setMaxValues(plan.selectionMode === "single" ? 1 : Math.max(1, plan.options.length))
-      .addOptions(plan.options.map((option) => ({ label: option.label, value: option.key, description: option.roleName.slice(0, 100), ...(option.emoji ? { emoji: option.emoji } : {}) }))))]
-    : plan.options.map((option) => {
-      const button = new ButtonBuilder().setCustomId(`rolebutton:${panelId}:${option.key}`).setLabel(option.label).setStyle(ButtonStyle.Secondary);
-      if (option.emoji) button.setEmoji(option.emoji);
-      return new ActionRowBuilder<ButtonBuilder>().addComponents(button);
-    });
-  return { embeds: [embed], components, allowedMentions: { parse: [] } };
-}
-
 function planDiff(before: PanelPlan | undefined, after: PanelPlan): string {
-  if (!before) return `作成: ${after.title}\n色: ${after.color}\n選択肢: ${after.options.map((option) => `${option.label} → ${option.roleName}`).join("、")}`;
+  if (!before) return `作成: ${after.title}\n色: ${after.color}\n表示: ${after.renderMode === "components_v2" ? "Components V2カード" : "Classic Embed"} / ${after.componentStyle}\n選択肢: ${after.options.map((option) => `${option.label} → ${option.roleName}`).join("、")}`;
   const changes: string[] = [];
   if (before.title !== after.title) changes.push(`タイトル: ${before.title} → ${after.title}`);
   if (before.description !== after.description) changes.push("説明文を変更");
   if (before.color !== after.color) changes.push(`色: ${before.color} → ${after.color}`);
+  if (before.renderMode !== after.renderMode) changes.push(`描画方式: ${before.renderMode} → ${after.renderMode}`);
   if (before.componentStyle !== after.componentStyle || before.selectionMode !== after.selectionMode) changes.push(`操作方式: ${before.componentStyle}/${before.selectionMode} → ${after.componentStyle}/${after.selectionMode}`);
   const oldKeys = new Set(before.options.map((option) => option.key));
   const newKeys = new Set(after.options.map((option) => option.key));
@@ -90,6 +76,7 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
     let plan = result.plan;
     if (selectedPanel && (plan.intent !== "edit" || plan.panelId !== selectedPanel.id || plan.expectedRevision !== selectedPanel.revision)) throw new Error("編集対象またはrevisionが一致しません。もう一度パネルを選んでください。");
     if (!selectedPanel && plan.intent !== "create") throw new Error("編集対象パネルを確定できませんでした。");
+    if (selectedPanel && panelPlanSchema.parse(selectedPanel.spec).renderMode !== plan.renderMode) throw new Error("Discordのメッセージ仕様上、既存パネルの描画方式は変更できません。別パネルとして作成してください。");
     const trustedChannelId = selectedPanel?.channelId ?? interaction.channelId;
     if (!trustedChannelId || plan.channelId && plan.channelId !== trustedChannelId) throw new Error("この操作では依頼したチャンネルへの発行のみ対応しています。");
     plan = panelPlanSchema.parse({ ...plan, channelId: trustedChannelId });
@@ -281,7 +268,7 @@ async function handlePanelComponent(interaction: import("discord.js").StringSele
   await interaction.deferReply({ ephemeral: true });
   const [kind, panelId, key] = interaction.customId.split(":");
   const [panel] = await db.select().from(panels).where(and(eq(panels.id, panelId!), eq(panels.guildId, interaction.guildId!))).limit(1);
-  if (!panel) return void await interaction.reply({ content: "このパネルは利用できません。", ephemeral: true });
+  if (!panel) return void await interaction.editReply("このパネルは利用できません。");
   const bindings = await db.select().from(panelOptions).where(eq(panelOptions.panelId, panel.id));
   const chosenKeys = kind === "rolepanel" && interaction.isStringSelectMenu()
     ? new Set(interaction.values.map((value) => bindings.find((binding) => binding.key === value || binding.roleId === value)?.key).filter((value): value is string => Boolean(value)))
@@ -347,11 +334,47 @@ async function drawGiveaway(giveawayId: string): Promise<void> {
       const completed = await tx.update(giveaways).set({ state: "COMPLETED", winners }).where(and(eq(giveaways.id, giveawayId), eq(giveaways.state, "DRAWING"))).returning({ id: giveaways.id });
       if (!completed.length) return;
       await tx.insert(auditEvents).values({ id: randomUUID(), jobId: giveawayId, guildId: giveaway.guildId, actorId: giveaway.hostId, action: "giveaway.draw", outcome: "success", detail: { entryCount: entries.length, winners } });
+      await tx.insert(giveawayNotifications).values({
+        id: randomUUID(), giveawayId, guildId: giveaway.guildId, channelId: giveaway.channelId,
+        content: giveawayResultMessage(giveaway.prize, winners), allowedUsers: winners,
+      });
     });
-    const guild = client.guilds.cache.get(giveaway.guildId);
-    const channel = await guild?.channels.fetch(giveaway.channelId).catch(() => null);
-    if (channel?.isSendable()) await channel.send({ content: winners.length ? `🎉 **${giveaway.prize}** 当選者: ${winners.map((id) => `<@${id}>`).join(", ")}` : `「${giveaway.prize}」は応募者なしで終了しました。`, allowedMentions: { parse: [], users: winners } });
   });
+}
+
+async function dispatchGiveawayNotifications(): Promise<void> {
+  const now = new Date();
+  const due = await db.select().from(giveawayNotifications).where(or(
+    and(eq(giveawayNotifications.state, "PENDING"), lte(giveawayNotifications.availableAt, now)),
+    and(eq(giveawayNotifications.state, "SENDING"), sql`${giveawayNotifications.leaseExpiresAt} < ${now}`),
+  )).orderBy(giveawayNotifications.createdAt).limit(20);
+
+  for (const row of due) {
+    const owner = randomUUID();
+    const [claimed] = await db.update(giveawayNotifications).set({
+      state: "SENDING", leaseOwner: owner, leaseExpiresAt: new Date(Date.now() + 120_000), attempts: sql`${giveawayNotifications.attempts} + 1`,
+    }).where(and(eq(giveawayNotifications.id, row.id), or(
+      and(eq(giveawayNotifications.state, "PENDING"), lte(giveawayNotifications.availableAt, new Date())),
+      and(eq(giveawayNotifications.state, "SENDING"), sql`${giveawayNotifications.leaseExpiresAt} < now()`),
+    ))).returning();
+    if (!claimed) continue;
+
+    try {
+      const guild = client.guilds.cache.get(claimed.guildId) ?? await client.guilds.fetch(claimed.guildId);
+      const channel = await guild.channels.fetch(claimed.channelId);
+      if (!channel?.isSendable()) throw new Error("Giveaway通知チャンネルを利用できません。");
+      const allowedUsers = Array.isArray(claimed.allowedUsers) ? claimed.allowedUsers.filter((user): user is string => typeof user === "string") : [];
+      await channel.send({ content: claimed.content, allowedMentions: { parse: [], users: allowedUsers } });
+      await db.update(giveawayNotifications).set({ state: "SENT", sentAt: new Date(), leaseOwner: null, leaseExpiresAt: null, lastError: null })
+        .where(and(eq(giveawayNotifications.id, claimed.id), eq(giveawayNotifications.state, "SENDING"), eq(giveawayNotifications.leaseOwner, owner)));
+    } catch (error) {
+      const retryAt = new Date(Date.now() + giveawayNotificationRetryDelayMs(claimed.attempts));
+      const lastError = error instanceof Error ? error.message.slice(0, 500) : "unknown notification delivery failure";
+      await db.update(giveawayNotifications).set({ state: "PENDING", availableAt: retryAt, leaseOwner: null, leaseExpiresAt: null, lastError })
+        .where(and(eq(giveawayNotifications.id, claimed.id), eq(giveawayNotifications.state, "SENDING"), eq(giveawayNotifications.leaseOwner, owner)));
+      console.error(JSON.stringify({ level: "error", event: "giveaway.notification_retry", notificationId: claimed.id, attempts: claimed.attempts, retryAt, error: lastError }));
+    }
+  }
 }
 
 async function recoverInterruptedDraws(): Promise<number> {
@@ -415,7 +438,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (interaction.isChatInputCommand() && interaction.commandName === "giveaway") {
       if (!interaction.guild || !interaction.channel?.isSendable()) return void await interaction.reply({ content: "サーバーのテキストチャンネルで実行してください。", ephemeral: true });
-      const giveawayChannel = interaction.channel;
       await interaction.deferReply({ ephemeral: true });
       const actor = await interaction.guild.members.fetch(interaction.user.id);
       requireAdmin(actor);
@@ -449,9 +471,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const previousWinners = new Set((entry.winners as string[] | null) ?? []);
           const candidates = entries.map((row) => row.userId).filter((userId) => !previousWinners.has(userId));
           const winners = drawWinners(candidates, entry.winnerCount);
-          await db.update(giveaways).set({ winners }).where(and(eq(giveaways.id, entry.id), eq(giveaways.state, "COMPLETED")));
-          await db.insert(auditEvents).values({ id: randomUUID(), jobId: entry.id, guildId: entry.guildId, actorId: interaction.user.id, action: "giveaway.reroll", outcome: "success", detail: { previousWinners: [...previousWinners], winners } });
-          await giveawayChannel.send({ content: winners.length ? `🎉 **${entry.prize}** 再抽選の当選者: ${winners.map((id) => `<@${id}>`).join(", ")}` : "再抽選できる応募者がいません。", allowedMentions: { parse: [], users: winners } });
+          await db.transaction(async (tx) => {
+            const updated = await tx.update(giveaways).set({ winners }).where(and(eq(giveaways.id, entry.id), eq(giveaways.state, "COMPLETED"))).returning({ id: giveaways.id });
+            if (!updated.length) throw new Error("企画状態が変わりました。再度確認してください。");
+            await tx.insert(auditEvents).values({ id: randomUUID(), jobId: entry.id, guildId: entry.guildId, actorId: interaction.user.id, action: "giveaway.reroll", outcome: "success", detail: { previousWinners: [...previousWinners], winners } });
+            await tx.insert(giveawayNotifications).values({
+              id: randomUUID(), giveawayId: entry.id, guildId: entry.guildId, channelId: entry.channelId,
+              content: giveawayResultMessage(entry.prize, winners, true), allowedUsers: winners,
+            });
+          });
         });
         return void await interaction.editReply("再抽選を完了しました。");
       }
@@ -535,6 +563,8 @@ client.once(Events.ClientReady, async (ready) => {
   setInterval(() => void recoverExpiredExecutionLeases().then((count) => { if (count) console.error(JSON.stringify({ level: "error", event: "jobs.recovery_required", count })); }).catch((error) => console.error("lease recovery failed", error)), 30_000).unref();
   setInterval(() => void db.select({ id: giveaways.id }).from(giveaways).where(and(eq(giveaways.state, "ACTIVE"), sql`${giveaways.endsAt} <= now()`)).then((due) => Promise.all(due.map((row) => drawGiveaway(row.id)))).catch((error) => console.error("giveaway scheduler failed", error)), 15_000).unref();
   setInterval(() => void recoverInterruptedDraws().catch((error) => console.error("giveaway draw recovery failed", error)), 60_000).unref();
+  setInterval(() => void dispatchGiveawayNotifications().catch((error) => console.error("giveaway notification dispatcher failed", error)), 5_000).unref();
+  void dispatchGiveawayNotifications().catch((error) => console.error("initial giveaway notification dispatch failed", error));
 });
 
 const rest = client.rest;

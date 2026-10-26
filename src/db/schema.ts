@@ -116,6 +116,23 @@ export const giveawayEntries = pgTable("giveaway_entries", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [primaryKey({ columns: [table.giveawayId, table.userId] })]);
 
+export const giveawayNotifications = pgTable("giveaway_notifications", {
+  id: text("id").primaryKey(),
+  giveawayId: text("giveaway_id").notNull().references(() => giveaways.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  channelId: text("channel_id").notNull(),
+  content: text("content").notNull(),
+  allowedUsers: jsonb("allowed_users").notNull(),
+  state: text("state").default("PENDING").notNull(),
+  attempts: integer("attempts").default(0).notNull(),
+  availableAt: timestamp("available_at", { withTimezone: true }).defaultNow().notNull(),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  sentAt: timestamp("sent_at", { withTimezone: true }),
+  lastError: text("last_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [index("giveaway_notifications_due_idx").on(table.state, table.availableAt), index("giveaway_notifications_guild_idx").on(table.guildId)]);
+
 export const runtimeLeases = pgTable("runtime_leases", {
   guildId: text("guild_id").primaryKey(),
   jobId: text("job_id").notNull(),
