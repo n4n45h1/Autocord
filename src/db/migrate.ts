@@ -157,6 +157,14 @@ try {
       created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(workflow_id, trigger_id)
     );
     CREATE INDEX IF NOT EXISTS workflow_schedules_due_idx ON workflow_schedules(state, next_at);
+    CREATE TABLE IF NOT EXISTS workflow_voice_channels (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, source_channel_id text NOT NULL, voice_channel_id text NOT NULL,
+      state text NOT NULL DEFAULT 'ACTIVE', created_by text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(), closed_at timestamptz,
+      UNIQUE(guild_id, voice_channel_id)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_voice_channels_active_source_idx ON workflow_voice_channels(workflow_id, source_channel_id, state);
     ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS remaining_seconds integer;
     CREATE TABLE IF NOT EXISTS runtime_leases (
       guild_id text PRIMARY KEY, job_id text NOT NULL, owner text NOT NULL, expires_at timestamptz NOT NULL

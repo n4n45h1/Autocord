@@ -238,3 +238,15 @@ export const workflowSchedules = pgTable("workflow_schedules", {
   lastError: text("last_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [uniqueIndex("workflow_schedules_workflow_trigger_idx").on(table.workflowId, table.triggerId), index("workflow_schedules_due_idx").on(table.state, table.nextAt)]);
+
+export const workflowVoiceChannels = pgTable("workflow_voice_channels", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  sourceChannelId: text("source_channel_id").notNull(),
+  voiceChannelId: text("voice_channel_id").notNull(),
+  state: text("state").default("ACTIVE").notNull(),
+  createdBy: text("created_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
+}, (table) => [uniqueIndex("workflow_voice_channels_guild_channel_idx").on(table.guildId, table.voiceChannelId), index("workflow_voice_channels_active_source_idx").on(table.workflowId, table.sourceChannelId, table.state)]);

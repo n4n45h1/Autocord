@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { interactiveWorkflowRevisions, interactiveWorkflows, workflowEntries, workflowRuns, workflowSchedules, workflowStates } from "./schema.js";
+import { interactiveWorkflowRevisions, interactiveWorkflows, managedChannels, workflowEntries, workflowRuns, workflowSchedules, workflowStates, workflowVoiceChannels } from "./schema.js";
 
 const postgresTests = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -21,6 +21,7 @@ postgresTests("PostgreSQL Interactive Workflow state", () => {
   afterAll(async () => {
     if (!db) return;
     await db.delete(interactiveWorkflows).where(eq(interactiveWorkflows.id, workflowId));
+    await db.delete(managedChannels).where(eq(managedChannels.ownerJobId, workflowId));
     await pool.end();
   });
 
@@ -63,5 +64,18 @@ postgresTests("PostgreSQL Interactive Workflow state", () => {
     await db.insert(interactiveWorkflowRevisions).values({ id: randomUUID(), workflowId, guildId, jobId: "update-job", actorId: "admin", version: 2, beforeSpec: { test: "v1" }, afterSpec: { test: "v2" } });
     expect(updated[0]?.version).toBe(2);
     expect(stale).toHaveLength(0);
+  });
+
+  it("binds temporary Voice Channels to their creator Workflow and closes sessions", async () => {
+    const voiceChannelId = `test-voice-${randomUUID()}`;
+    const sessionId = randomUUID();
+    await db.insert(managedChannels).values({ guildId, channelId: voiceChannelId, ownerJobId: workflowId, kind: "voice" });
+    await db.insert(workflowVoiceChannels).values({ id: sessionId, workflowId, guildId, sourceChannelId: "test-lobby", voiceChannelId, state: "ACTIVE", createdBy: "member-a" });
+    const [active] = await db.select().from(workflowVoiceChannels).where(eq(workflowVoiceChannels.id, sessionId));
+    expect(active?.state).toBe("ACTIVE");
+    expect(active?.workflowId).toBe(workflowId);
+    await db.update(workflowVoiceChannels).set({ state: "CLOSED", closedAt: new Date() }).where(eq(workflowVoiceChannels.id, sessionId));
+    const [closed] = await db.select().from(workflowVoiceChannels).where(eq(workflowVoiceChannels.id, sessionId));
+    expect(closed?.state).toBe("CLOSED");
   });
 });

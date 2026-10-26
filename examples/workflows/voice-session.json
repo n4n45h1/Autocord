@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "name": "Lobby-to-temporary-VC",
+  "title": "一時VC募集",
+  "description": "Lobbyに2人以上集まると専用VCを作成し、参加者を移動します。全員退出後にそのVCを削除します。",
+  "color": "purple",
+  "components": [
+    {
+      "key": "status",
+      "kind": "button",
+      "label": "募集状況",
+      "style": "secondary",
+      "emoji": null,
+      "triggerId": "status-trigger"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "status-trigger",
+      "event": "button",
+      "componentKey": "status",
+      "steps": [
+        { "id": "refresh", "action": "panel.refresh" }
+      ]
+    },
+    {
+      "id": "create-trigger",
+      "event": "voice.member_join_event",
+      "voiceChannelId": "00000000000000000",
+      "steps": [
+        {
+          "id": "create-or-reuse",
+          "action": "voice.channel.create",
+          "name": "valorant-party",
+          "moveMembers": true,
+          "when": {
+            "op": "or",
+            "conditions": [
+              { "op": "voice.members.gte", "value": 2 },
+              { "op": "voice.session.exists" }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "delete-trigger",
+      "event": "voice.member_leave_event",
+      "steps": [
+        {
+          "id": "delete-when-empty",
+          "action": "voice.channel.delete",
+          "when": { "op": "voice.members.eq", "value": 0 }
+        }
+      ]
+    }
+  ]
+}

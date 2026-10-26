@@ -6,6 +6,10 @@ import { globalAiSlotStates } from "../../jobs/state.js";
 
 export type UsageReservation = { id: string; period: string };
 
+export function isWithinMonthlyLimit(used: number, limit: number): boolean {
+  return limit <= 0 || used < limit;
+}
+
 export async function reserveUsage(guildId: string, userId: string, jobId: string, mode: "mini" | "max", instruction: string): Promise<UsageReservation> {
   const period = new Date().toISOString().slice(0, 7);
   const id = randomUUID();
@@ -24,7 +28,7 @@ export async function reserveUsage(guildId: string, userId: string, jobId: strin
     if ((globalActive[0]?.count ?? 0) >= Number(process.env.MAX_CONCURRENT_AI_JOBS ?? 5)) throw new Error("Autocord全体のAI処理が混雑しています。少し待ってから再度お試しください。");
     const limit = mode === "mini" ? settings!.miniMonthlyLimit : settings!.maxMonthlyLimit;
     const used = await tx.select({ count: sql<number>`count(*)::int` }).from(usageRecords).where(and(eq(usageRecords.guildId, guildId), eq(usageRecords.period, period), eq(usageRecords.mode, mode)));
-    if ((used[0]?.count ?? 0) >= limit) throw new Error(`今月のAgentcord ${mode === "mini" ? "Mini" : "Max"}利用上限（${limit}回）に達しました。`);
+    if (!isWithinMonthlyLimit(used[0]?.count ?? 0, limit)) throw new Error(`今月のAgentcord ${mode === "mini" ? "Mini" : "Max"}利用上限（${limit}回）に達しました。`);
     const recent = await tx.select({ id: usageRecords.id }).from(usageRecords).where(and(eq(usageRecords.guildId, guildId), eq(usageRecords.userId, userId), gt(usageRecords.createdAt, new Date(Date.now() - 10_000)))).limit(1);
     if (recent.length) throw new Error("短時間の連続利用です。少し待ってから再度お試しください。");
     await tx.insert(usageRecords).values({ id, guildId, userId, jobId, mode, model: "pending", period });

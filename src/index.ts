@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Events,
   ChannelType, GatewayIntentBits, ModalBuilder, PermissionFlagsBits, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
-  type ChatInputCommandInteraction, type GuildMember, type InteractionReplyOptions, type MessageCreateOptions, type Role,
+  type ChatInputCommandInteraction, type GuildMember, type InteractionReplyOptions, type MessageCreateOptions, type ModalSubmitInteraction, type Role,
 } from "discord.js";
 import { and, eq, gt, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import { db, pool } from "./db/client.js";
@@ -21,10 +21,11 @@ import { drawWinners, giveawayNotificationRetryDelayMs, giveawayResultMessage } 
 import { renderPanel } from "./features/panels/render.js";
 import { listAgentSkills, parseResourceWorkflowInput, parseSkillInput, resolvePanelSkill, resolveResourceSkill, type AgentSkillId } from "./agent/skills/registry.js";
 import { compileInteractiveWorkflow, interactiveWorkflowSchema, type InteractiveWorkflow, type InteractiveWorkflowStep } from "./agent/interactive-workflow.js";
-import { dispatchWorkflowSchedules, handleInteractiveWorkflowInteraction, publishInteractiveWorkflow, recoverStaleInteractiveRuns, updateInteractiveWorkflow } from "./features/workflows/engine.js";
+import { analyzeRequestRequirements, validatePlanTargetAgainstRequest, validateWorkflowAgainstRequest } from "./agent/requirements.js";
+import { cleanupEmptyWorkflowVoiceChannels, dispatchWorkflowSchedules, handleInteractiveWorkflowInteraction, handleWorkflowVoiceStateUpdate, publishInteractiveWorkflow, recoverStaleInteractiveRuns, updateInteractiveWorkflow } from "./features/workflows/engine.js";
 import { renderInteractiveWorkflow } from "./features/workflows/render.js";
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const workerId = randomUUID();
 const adminPerms = [PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles];
 
@@ -77,19 +78,74 @@ async function assertWorkflowManagedRoles(guildId: string, guild: import("discor
   const roleNames = new Set(workflow.triggers.flatMap((trigger) => trigger.steps)
     .filter((step) => step.action === "role.grant" || step.action === "role.revoke").map((step) => step.roleName));
   const owned = await db.select({ roleId: managedRoles.roleId, ownerJobId: managedRoles.ownerJobId }).from(managedRoles).where(eq(managedRoles.guildId, guildId));
+  for (const step of workflow.triggers.flatMap((trigger) => trigger.steps).filter((item) => item.action === "resource.role.create")) {
+    if (guild.roles.cache.some((role) => role.name === step.name)) throw new Error(`Workflow role.create cannot shadow an existing role name: ${step.name}`);
+  }
   for (const roleName of roleNames) {
     const matches = [];
     for (const record of owned) {
       const role = guild.roles.cache.get(record.roleId) ?? await guild.roles.fetch(record.roleId).catch(() => null);
       if (role?.name === roleName) matches.push({ role, ownerJobId: record.ownerJobId });
     }
-    if (matches.length !== 1) throw new Error(matches.length ? `Workflow role is ambiguous: ${roleName}` : `Workflow role must be created and owned by Autocord first: ${roleName}`);
-    assertSelfAssignableRole(guild, matches[0]!.role, matches[0]!.ownerJobId);
+    if (matches.length > 1) throw new Error(`Workflow role is ambiguous: ${roleName}`);
+    if (matches.length === 1) {
+      assertSelfAssignableRole(guild, matches[0]!.role, matches[0]!.ownerJobId);
+      continue;
+    }
+    const createsInWorkflow = workflow.triggers.some((trigger) => trigger.steps.some((step) => step.action === "resource.role.create" && step.name === roleName));
+    if (!createsInWorkflow) throw new Error(`Role ${roleName} must already be Autocord-managed or be created by a resource.role.create step in this Workflow.`);
+  }
+}
+
+async function assertWorkflowVoiceBindings(guild: import("discord.js").Guild, workflow: InteractiveWorkflow): Promise<void> {
+  const bot = guild.members.me;
+  if (!bot) throw new Error("Bot guild member could not be resolved.");
+  for (const trigger of workflow.triggers) {
+    if (trigger.event !== "voice.member_join_event") continue;
+    const channel = await guild.channels.fetch(trigger.voiceChannelId).catch(() => null);
+    if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error(`Voice Lobby ${trigger.voiceChannelId} does not resolve to a Guild Voice Channel in this server.`);
+    const permissions = channel.permissionsFor(bot);
+    if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers])) throw new Error(`Bot needs View Channel, Connect, Manage Channels and Move Members in Voice Lobby ${channel.name}.`);
   }
 }
 
 function interactiveWorkflowSummary(workflow: InteractiveWorkflow): string {
-  return `${workflow.name}\nUI: ${workflow.components.map((component) => `${component.kind}:${component.key}`).join("、")}\nTriggers:\n${workflow.triggers.map((trigger) => `• ${trigger.event}${"componentKey" in trigger ? `(${trigger.componentKey})` : ""}: ${trigger.steps.map((step) => step.action).join(" → ")}`).join("\n")}`;
+  const effect = (step: InteractiveWorkflowStep): string => {
+    switch (step.action) {
+      case "entry.join": return `entry.join ${step.collection} max=${step.maxEntries}`;
+      case "entry.leave": return `entry.leave ${step.collection}`;
+      case "state.set": return `state.set ${step.scope}:${step.key}`;
+      case "role.grant": return `role.grant ${step.roleName} to trigger member`;
+      case "role.revoke": return `role.revoke ${step.roleName} from trigger member`;
+      case "message.send": return `message.send ${step.delivery === "workflow_owner_dm" ? "Workflow owner DM (private)" : "workflow channel (public)"}`;
+      case "message.edit": return "message.edit Workflow panel display";
+      case "panel.refresh": return "panel.refresh rendered state/components";
+      case "voice.channel.create": return `voice.channel.create ${step.name}; moveMembers=${step.moveMembers}; copy source permission overwrites`;
+      case "voice.channel.delete": return "voice.channel.delete Workflow-owned channel when empty";
+      case "resource.role.create": return `resource.role.create ${step.name} (no permissions)`;
+      case "resource.channel.create_category": return `resource.channel.create_category ${step.name} (Guild default permissions)`;
+      case "resource.channel.create_text": return `resource.channel.create_text ${step.name}${step.categoryStepId ? ` under category step ${step.categoryStepId}` : ""} (Guild default permissions)`;
+      case "giveaway.create": return `giveaway.create ${step.prize}; ${step.winnerCount} winners; ${step.durationSeconds}s`;
+      case "giveaway.join": return `giveaway.join ${step.giveawayId} for trigger member`;
+      case "giveaway.leave": return `giveaway.leave ${step.giveawayId} for trigger member`;
+      case "giveaway.end": return `giveaway.end ${step.giveawayId}`;
+      case "giveaway.pause": return `giveaway.pause ${step.giveawayId}`;
+      case "giveaway.resume": return `giveaway.resume ${step.giveawayId}`;
+      case "giveaway.reroll": return `giveaway.reroll ${step.giveawayId}`;
+    }
+  };
+  const componentSummary = workflow.components.map((component) => {
+    if (component.kind === "modal") return `modal:${component.key} (${component.inputs.map((input) => `${input.key}:${input.label}${input.required ? " required" : ""}`).join(", ")})`;
+    if (component.kind === "select") return `select:${component.key} (${component.options.length} options: ${component.options.slice(0, 5).map((option) => option.label).join(", ")}${component.options.length > 5 ? ", …" : ""})`;
+    return `button:${component.key} ${component.label} [${component.style}]`;
+  }).join("; ");
+  const triggerSummary = workflow.triggers.map((trigger) => {
+    const timing = trigger.event === "schedule" ? ` every ${trigger.intervalSeconds}s` : trigger.event === "deadline" ? ` after ${trigger.afterSeconds}s` : "";
+    const voiceSource = "voiceChannelId" in trigger ? ` sourceVoice=${trigger.voiceChannelId}` : "";
+    const steps = trigger.steps.map((step) => `${step.id}: ${effect(step)}${step.dependsOn.length ? ` after[${step.dependsOn.join(",")}]` : ""}${step.when ? ` when ${JSON.stringify(step.when)}` : ""}`).join(" → ");
+    return `• ${trigger.event}${"componentKey" in trigger ? `(${trigger.componentKey})` : ""}${voiceSource}${timing}: ${steps}`;
+  }).join("\n");
+  return `${workflow.name}\nUI: ${componentSummary}\nTriggers and side effects:\n${triggerSummary}`;
 }
 
 function interactiveWorkflowDiff(before: InteractiveWorkflow, after: InteractiveWorkflow, version: number): string {
@@ -105,35 +161,75 @@ function preview(plan: PanelPlan | null, jobId: string, before?: PanelPlan, work
   const diff = plan ? planDiff(before, plan) : interactiveWorkflow ? beforeWorkflow ? interactiveWorkflowDiff(beforeWorkflow, interactiveWorkflow, workflowVersion ?? 1) : interactiveWorkflowSummary(interactiveWorkflow) : resourceSteps?.map(resourceStepSummary).join("\n") ?? "";
   const panelSteps = workflowSteps?.length ? `\n\n**Max Workflow**\n${workflowSteps.map((step, index) => `${index + 1}. ${step.id}: ${step.action}${step.dependsOn.length ? ` (after ${step.dependsOn.join(", ")})` : ""}`).join("\n")}` : "";
   const guildSteps = resourceSteps?.length ? `\n\n**Max Resource Skills**\n${resourceSteps.map((step, index) => `${index + 1}. ${step.id}: ${resourceStepSummary(step)}${step.dependsOn.length ? ` (after ${step.dependsOn.join(", ")})` : ""}`).join("\n")}` : "";
-  return { content: `**${title}**\n${diff}${panelSteps}${guildSteps}\n\nジョブ: \`${jobId}\`\n10分以内に管理者が承認してください。`, components: [row], allowedMentions: { parse: [] } };
+  const content = `**${title}**\n${diff}${panelSteps}${guildSteps}\n\nジョブ: \`${jobId}\`\n10分以内に管理者が承認してください。`;
+  return { content: content.length > 1900 ? `${content.slice(0, 1880)}\n…（詳細は省略。登録Skills/副作用の一覧を確認してください）` : content, components: [row], allowedMentions: { parse: [] } };
 }
 
-type PlanInteraction = Pick<ChatInputCommandInteraction, "guild" | "guildId" | "user" | "channel" | "channelId" | "followUp">;
+type PlanInteraction = Pick<ChatInputCommandInteraction, "guild" | "guildId" | "user" | "channel" | "channelId" | "followUp" | "editReply"> | Pick<ModalSubmitInteraction, "guild" | "guildId" | "user" | "channel" | "channelId" | "followUp" | "editReply">;
+
+async function savePlanClarification(input: {
+  interaction: PlanInteraction;
+  jobId: string;
+  reservation?: UsageReservation;
+  clarification: { questions: string[]; missingSkills: string[] };
+  selectedPanel?: typeof panels.$inferSelect;
+  selectedWorkflow?: typeof interactiveWorkflows.$inferSelect;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}): Promise<void> {
+  const { interaction, jobId, reservation, clarification, selectedPanel, selectedWorkflow } = input;
+  const explanation = [
+    clarification.missingSkills.length ? "要求を満たすSkillsが未実装です。別機能のPlanには置き換えません。" : "Planを公開する前に、次の確認事項への回答が必要です。",
+    ...clarification.questions.map((question, index) => `${index + 1}. ${question}`),
+    ...(clarification.missingSkills.length ? [`開発者向けSkills提案: ${clarification.missingSkills.join("、")}`] : []),
+  ].join("\n");
+  const clarificationContext = { clarification, panelId: selectedPanel?.id ?? null, expectedPanelRevision: selectedPanel?.revision ?? null, workflowId: selectedWorkflow?.id ?? null, expectedWorkflowVersion: selectedWorkflow?.version ?? null };
+  const components = clarification.missingSkills.length ? [] : [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(`clarify:${jobId}`).setLabel("確認事項に回答").setStyle(ButtonStyle.Primary))];
+  await db.update(agentJobs).set({ state: "NEEDS_INPUT", executionContext: clarificationContext, updatedAt: new Date() })
+    .where(and(eq(agentJobs.id, jobId), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "PLANNING")));
+  await db.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "plan.needs_input", outcome: clarification.missingSkills.length ? "missing_skills" : "clarification", detail: { questions: clarification.questions.length, missingSkills: clarification.missingSkills } });
+  if (reservation) await finishUsage(reservation, input.model ?? "requirements-validator", input.inputTokens ?? 0, input.outputTokens ?? 0);
+  await interaction.editReply({ content: explanation, components, allowedMentions: { parse: [] } });
+}
 
 async function writePlan(interaction: PlanInteraction, jobId: string, instruction: string, mode: AgentMode, selectedPanel?: typeof panels.$inferSelect, reservation?: UsageReservation, selectedWorkflow?: typeof interactiveWorkflows.$inferSelect): Promise<boolean> {
   const existing = selectedPanel ? stablePanelPlan(panelPlanSchema.parse(selectedPanel.spec), selectedPanel.id, selectedPanel.revision) : undefined;
   try {
     const existingWorkflowSpec = selectedWorkflow ? interactiveWorkflowSchema.parse(selectedWorkflow.spec) : undefined;
+    const requestRequirements = analyzeRequestRequirements(instruction);
     const managedRoleBindings = await db.select({ roleId: managedRoles.roleId }).from(managedRoles).where(eq(managedRoles.guildId, interaction.guildId!));
     const availableManagedRoles: string[] = [];
     for (const binding of managedRoleBindings) {
       const role = interaction.guild!.roles.cache.get(binding.roleId) ?? await interaction.guild!.roles.fetch(binding.roleId).catch(() => null);
       if (role) availableManagedRoles.push(role.name);
     }
-    const result = await makePlan(instruction, existing, mode, selectedWorkflow ? { id: selectedWorkflow.id, version: selectedWorkflow.version, spec: existingWorkflowSpec! } : undefined, availableManagedRoles);
+    const allChannels = await interaction.guild!.channels.fetch();
+    const allVoiceChannels = [...allChannels.values()].flatMap((channel) => channel && channel.type === ChannelType.GuildVoice ? [{ id: channel.id, name: channel.name, category: channel.parent?.name ?? null }] : []);
+    const namedVoiceChannels = allVoiceChannels.filter((channel) => instruction.toLocaleLowerCase().includes(channel.name.toLocaleLowerCase()));
+    if (requestRequirements.voiceRequested && !allVoiceChannels.length) {
+      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: ["先に参加者が集まるVoice Lobbyをサーバーへ作成してください。その後、/agentのworkflow_idまたはLobby名を指定して再依頼してください。"], missingSkills: [] } });
+      return false;
+    }
+    if (requestRequirements.voiceRequested && allVoiceChannels.length > 1 && namedVoiceChannels.length !== 1) {
+      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: [`どのVoice Lobbyを監視しますか？候補: ${allVoiceChannels.map((channel) => channel.name).join("、")}`], missingSkills: [] } });
+      return false;
+    }
+    const availableVoiceChannels = requestRequirements.voiceRequested && namedVoiceChannels.length === 1 ? namedVoiceChannels : allVoiceChannels;
+    const result = await makePlan(instruction, existing, mode, selectedWorkflow ? { id: selectedWorkflow.id, version: selectedWorkflow.version, spec: existingWorkflowSpec! } : undefined, availableManagedRoles, availableVoiceChannels);
     const actor = await interaction.guild!.members.fetch(interaction.user.id);
 
     if (result.clarification) {
-      const explanation = [
-        "追加情報が必要です。以下に回答してから、もう一度`/agent`で依頼してください。",
-        ...result.clarification.questions.map((question, index) => `${index + 1}. ${question}`),
-        ...(result.clarification.missingSkills.length ? [`未実装Skill候補: ${result.clarification.missingSkills.join("、")}`] : []),
-      ].join("\n");
-      await db.update(agentJobs).set({ state: "NEEDS_INPUT", executionContext: { clarification: result.clarification }, updatedAt: new Date() })
-        .where(and(eq(agentJobs.id, jobId), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "PLANNING")));
-      await db.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "plan.needs_input", outcome: "clarification", detail: result.clarification });
-      if (reservation) await finishUsage(reservation, result.model, result.inputTokens, result.outputTokens);
-      await interaction.followUp({ content: explanation, ephemeral: true });
+      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: result.clarification, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
+      return false;
+    }
+    if (requestRequirements.voiceRequested && !availableVoiceChannels.length) {
+      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: ["募集の参加者が集まる既存Voice Lobbyを作成し、Workflow ID autocompleteから再依頼してください。"], missingSkills: [] }, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
+      return false;
+    }
+    const targetIssues = validatePlanTargetAgainstRequest(instruction, result.interactiveWorkflow ? "interactive" : result.resourceSteps ? "resources" : "panel");
+    if (targetIssues.length) {
+      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: targetIssues, missingSkills: [] }, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
       return false;
     }
 
@@ -162,7 +258,13 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
       const destination = workflowChannelId ? interaction.guild!.channels.cache.get(workflowChannelId) ?? await interaction.guild!.channels.fetch(workflowChannelId).catch(() => null) : null;
       if (!destination?.isSendable() || !workflowChannelId) throw new Error("Workflowの公開/更新チャンネルに送信できません。");
       const workflow = compileInteractiveWorkflow(result.interactiveWorkflow);
+      const requirementIssues = validateWorkflowAgainstRequest(instruction, workflow);
+      if (requirementIssues.length) {
+        await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: requirementIssues, missingSkills: [] }, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
+        return false;
+      }
       assertInteractiveWorkflowPermissions(interaction.guild!, workflow, actor);
+      await assertWorkflowVoiceBindings(interaction.guild!, workflow);
       if (selectedWorkflow) assertInteractiveWorkflowUpdatePermission(actor);
       await assertWorkflowManagedRoles(interaction.guildId!, interaction.guild!, workflow);
       if (Boolean(selectedWorkflow) !== Boolean(result.interactiveWorkflowId) || selectedWorkflow && result.expectedWorkflowVersion !== selectedWorkflow.version) throw new Error("更新対象Workflow/versionが一致しません。");
@@ -231,6 +333,14 @@ async function handleAgent(interaction: ChatInputCommandInteraction): Promise<vo
     if (!actor.permissions.has(PermissionFlagsBits.ManageGuild)) throw new Error("サーバー管理の権限が必要です。");
     const workflowId = interaction.options.getString("workflow_id");
     const mode = (interaction.options.getString("mode") ?? (workflowId ? "max" : "mini")) as AgentMode;
+    const instruction = interaction.options.getString("指示", true);
+    const requestRequirements = analyzeRequestRequirements(instruction);
+    if (mode === "mini" && requestRequirements.unsupportedSkills.length) {
+      return void await interaction.editReply(`この要求に必要なSkillsは未実装です: ${requestRequirements.unsupportedSkills.join("、")}。Workflowは作成しません。`);
+    }
+    if (mode === "mini" && requestRequirements.complex) {
+      return void await interaction.editReply("この依頼には複数のTrigger/Actionを組み合わせる必要があります。Planは作成していません。/agentのmodeをMaxにして再依頼してください。");
+    }
     let selectedWorkflow: typeof interactiveWorkflows.$inferSelect | undefined;
     if (workflowId) {
       if (mode !== "max") throw new Error("既存Interactive Workflow編集にはAgentcord Maxを選択してください。");
@@ -238,7 +348,6 @@ async function handleAgent(interaction: ChatInputCommandInteraction): Promise<vo
       if (!workflow) throw new Error("このサーバーの有効なInteractive Workflowが見つかりません。");
       selectedWorkflow = workflow;
     }
-    const instruction = interaction.options.getString("指示", true);
     reservation = await reserveUsage(interaction.guildId!, interaction.user.id, jobId, mode, instruction);
     const matches = !selectedWorkflow && isLikelyEdit(instruction) ? await db.select().from(panels).where(eq(panels.guildId, interaction.guildId!)).orderBy(sql`${panels.updatedAt} desc`).limit(25) : [];
     if (isLikelyEdit(instruction) && matches.length > 1) {
@@ -249,12 +358,97 @@ async function handleAgent(interaction: ChatInputCommandInteraction): Promise<vo
     }
     const selectedPanel = matches.length === 1 ? matches[0] : undefined;
     const previewCreated = await writePlan(interaction, jobId, instruction, mode, selectedPanel, reservation, selectedWorkflow);
-    await interaction.editReply({ content: previewCreated ? "プレビューを作成しました。表示された差分を確認してください。" : "Agentcordからの確認事項を確認してください。" });
+    if (previewCreated) await interaction.editReply({ content: "プレビューを作成しました。表示された差分を確認してください。" });
   } catch (error) {
     if (reservation) await failUsageReservation(reservation);
     const message = error instanceof Error ? error.message : "処理に失敗しました。";
     await interaction.editReply({ content: message }).catch(() => undefined);
   }
+}
+
+async function handleClarificationInteraction(interaction: import("discord.js").Interaction): Promise<boolean> {
+  const isOpen = interaction.isButton() && interaction.customId.startsWith("clarify:");
+  const isSubmit = interaction.isModalSubmit() && interaction.customId.startsWith("clarify-submit:");
+  if (!isOpen && !isSubmit) return false;
+  if (!interaction.guild) {
+    if (interaction.isRepliable()) await interaction.reply({ content: "確認はサーバー内で行ってください。", ephemeral: true });
+    return true;
+  }
+  const modalInteraction = isSubmit ? interaction as ModalSubmitInteraction : null;
+  if (modalInteraction) await modalInteraction.deferReply({ ephemeral: true });
+  const respond = async (content: string) => {
+    if (modalInteraction) await modalInteraction.editReply(content);
+    else if (interaction.isRepliable()) await interaction.reply({ content, ephemeral: true });
+  };
+  const jobId = interaction.customId.split(":")[1];
+  const [job] = await db.select().from(agentJobs).where(and(eq(agentJobs.id, jobId!), eq(agentJobs.guildId, interaction.guildId!))).limit(1);
+  if (!job || job.state !== "NEEDS_INPUT") {
+    await respond("この確認事項は期限切れか、すでに処理されています。");
+    return true;
+  }
+  const member = await interaction.guild.members.fetch(interaction.user.id);
+  if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+    await respond("確認事項への回答にはサーバー管理権限が必要です。");
+    return true;
+  }
+  if (isOpen) {
+    const context = job.executionContext as { clarification?: { questions?: string[] } } | null;
+    const firstQuestion = context?.clarification?.questions?.[0] ?? "不足情報を入力してください。";
+    const modal = new ModalBuilder().setCustomId(`clarify-submit:${job.id}`).setTitle("Planに必要な確認");
+    const answer = new TextInputBuilder().setCustomId("answers").setLabel("確認事項への回答").setPlaceholder(firstQuestion.slice(0, 100)).setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(answer));
+    await interaction.showModal(modal);
+    return true;
+  }
+
+  if (!modalInteraction) return true;
+
+  const answer = modalInteraction.fields.getTextInputValue("answers").trim();
+  if (!answer) {
+    await modalInteraction.editReply("回答が空です。確認事項に回答してください。");
+    return true;
+  }
+  const context = job.executionContext as { workflowId?: string | null; expectedWorkflowVersion?: number | null; panelId?: string | null; expectedPanelRevision?: number | null } | null;
+  let selectedWorkflow: typeof interactiveWorkflows.$inferSelect | undefined;
+  if (context?.workflowId) {
+    const [workflow] = await db.select().from(interactiveWorkflows).where(and(eq(interactiveWorkflows.id, context.workflowId), eq(interactiveWorkflows.guildId, interaction.guildId!), eq(interactiveWorkflows.state, "ACTIVE"))).limit(1);
+    if (!workflow || workflow.version !== context.expectedWorkflowVersion) {
+      await modalInteraction.editReply("対象Workflowのversionが変わりました。Workflow候補から選び直して依頼してください。");
+      return true;
+    }
+    selectedWorkflow = workflow;
+  }
+  let selectedPanel: typeof panels.$inferSelect | undefined;
+  if (context?.panelId) {
+    const [panel] = await db.select().from(panels).where(and(eq(panels.id, context.panelId), eq(panels.guildId, interaction.guildId!))).limit(1);
+    if (!panel || panel.revision !== context.expectedPanelRevision) {
+      await modalInteraction.editReply("対象Panelのrevisionが変わりました。Panelを選び直して依頼してください。");
+      return true;
+    }
+    selectedPanel = panel;
+  }
+  const newJobId = interaction.id;
+  const mode = job.mode as AgentMode;
+  const instruction = `${job.instruction}\n\n確認事項への回答:\n${answer}`;
+  let reservation: UsageReservation | undefined;
+  try {
+    const [claimed] = await db.update(agentJobs).set({ state: "ANSWERING", updatedAt: new Date() })
+      .where(and(eq(agentJobs.id, job.id), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "NEEDS_INPUT"))).returning({ id: agentJobs.id });
+    if (!claimed) {
+      await modalInteraction.editReply("この確認事項は別の操作で処理中です。");
+      return true;
+    }
+    reservation = await reserveUsage(interaction.guildId!, interaction.user.id, newJobId, mode, instruction);
+    const created = await writePlan(modalInteraction, newJobId, instruction, mode, selectedPanel, reservation, selectedWorkflow);
+    await db.update(agentJobs).set({ state: "SUPERSEDED", executionContext: { supersededBy: newJobId }, updatedAt: new Date() })
+      .where(and(eq(agentJobs.id, job.id), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "ANSWERING")));
+    if (created) await modalInteraction.editReply("回答を反映したプレビューを作成しました。差分を確認してください。");
+  } catch (error) {
+    if (reservation) await failUsageReservation(reservation);
+    await db.update(agentJobs).set({ state: "NEEDS_INPUT", updatedAt: new Date() }).where(and(eq(agentJobs.id, job.id), eq(agentJobs.state, "ANSWERING")));
+    await modalInteraction.editReply(error instanceof Error ? error.message : "確認後のPlan作成に失敗しました。").catch(() => undefined);
+  }
+  return true;
 }
 
 async function executeApproved(jobId: string, guildId: string, actor: GuildMember): Promise<string> {
@@ -285,6 +479,7 @@ async function executeApproved(jobId: string, guildId: string, actor: GuildMembe
       const workflow = interactiveWorkflowSchema.parse(context.interactiveWorkflow);
       if (!context.publishChannelId) throw new Error("Workflowの公開先がありません。");
       assertInteractiveWorkflowPermissions(guild, workflow, freshActor);
+      await assertWorkflowVoiceBindings(guild, workflow);
       await assertWorkflowManagedRoles(guildId, guild, workflow);
       if (context.workflowIntent === "edit") {
         if (!context.workflowId || context.expectedWorkflowVersion == null) throw new Error("Workflow update target/version is missing.");
@@ -652,6 +847,7 @@ async function handleWorkflowAutocomplete(interaction: import("discord.js").Auto
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isAutocomplete()) return await handleWorkflowAutocomplete(interaction);
+    if (await handleClarificationInteraction(interaction)) return;
     if (await handleInteractiveWorkflowInteraction(interaction)) return;
     if (interaction.isChatInputCommand() && interaction.commandName === "agent") return await handleAgent(interaction);
     if (interaction.isChatInputCommand() && interaction.commandName === "autocord") {
@@ -723,13 +919,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
           const settingsInput = parseSkillInput("settings.update", { miniMonthly: mini, maxMonthly: max }) as { miniMonthly: number | null; maxMonthly: number | null };
           const serviceMiniCap = Number(process.env.MINI_MONTHLY_LIMIT ?? 30);
           const serviceMaxCap = Number(process.env.MAX_MONTHLY_LIMIT ?? 5);
-          if (settingsInput.miniMonthly !== null && settingsInput.miniMonthly > serviceMiniCap || settingsInput.maxMonthly !== null && settingsInput.maxMonthly > serviceMaxCap) throw new Error("設定値はサービス上限を超えられません。");
+          if (settingsInput.miniMonthly !== null && serviceMiniCap > 0 && settingsInput.miniMonthly > serviceMiniCap || settingsInput.maxMonthly !== null && serviceMaxCap > 0 && settingsInput.maxMonthly > serviceMaxCap) throw new Error("設定値はサービス上限を超えられません。");
           await db.insert(guildSettings).values({ guildId: interaction.guildId!, miniMonthlyLimit: settingsInput.miniMonthly ?? serviceMiniCap, maxMonthlyLimit: settingsInput.maxMonthly ?? serviceMaxCap, updatedAt: new Date() }).onConflictDoUpdate({ target: guildSettings.guildId, set: { ...(settingsInput.miniMonthly !== null ? { miniMonthlyLimit: settingsInput.miniMonthly } : {}), ...(settingsInput.maxMonthly !== null ? { maxMonthlyLimit: settingsInput.maxMonthly } : {}), updatedAt: new Date() } });
         }
         parseSkillInput("settings.read", {});
         await db.insert(guildSettings).values({ guildId: interaction.guildId!, miniMonthlyLimit: Number(process.env.MINI_MONTHLY_LIMIT ?? 30), maxMonthlyLimit: Number(process.env.MAX_MONTHLY_LIMIT ?? 5) }).onConflictDoNothing();
         const [settings] = await db.select().from(guildSettings).where(eq(guildSettings.guildId, interaction.guildId!)).limit(1);
-        return void await interaction.editReply(`月間上限: Mini ${settings!.miniMonthlyLimit}回 / Max ${settings!.maxMonthlyLimit}回\n同時ジョブ上限: ${Number(process.env.MAX_CONCURRENT_JOBS_PER_GUILD ?? 1)}件`);
+        const miniLimit = settings!.miniMonthlyLimit > 0 ? `${settings!.miniMonthlyLimit}回` : "無制限";
+        const maxLimit = settings!.maxMonthlyLimit > 0 ? `${settings!.maxMonthlyLimit}回` : "無制限";
+        return void await interaction.editReply(`月間上限: Mini ${miniLimit} / Max ${maxLimit}\n同時ジョブ上限: ${Number(process.env.MAX_CONCURRENT_JOBS_PER_GUILD ?? 1)}件`);
       }
       parseSkillInput("audit.list", {});
       const rows = await db.select().from(auditEvents).where(eq(auditEvents.guildId, interaction.guildId!)).orderBy(sql`${auditEvents.createdAt} desc`).limit(10);
@@ -866,6 +1064,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  void handleWorkflowVoiceStateUpdate(oldState, newState).catch((error) => console.error(JSON.stringify({ level: "error", event: "workflow.voice_state_dispatch_failed", guildId: newState.guild.id, error: error instanceof Error ? error.message : "unknown" })));
+});
+
 client.once(Events.ClientReady, async (ready) => {
   console.info(JSON.stringify({ level: "info", event: "bot.ready", user: ready.user.tag, workerId }));
   const recovered = await recoverExpiredExecutionLeases().catch(() => 0);
@@ -880,8 +1082,10 @@ client.once(Events.ClientReady, async (ready) => {
   setInterval(() => void dispatchGiveawayNotifications().catch((error) => console.error("giveaway notification dispatcher failed", error)), 5_000).unref();
   setInterval(() => void recoverStaleInteractiveRuns().then((count) => { if (count) console.warn(JSON.stringify({ level: "warn", event: "workflow.runs_recovery_required", count })); }).catch((error) => console.error("interactive workflow recovery failed", error)), 60_000).unref();
   setInterval(() => void dispatchWorkflowSchedules(client).catch((error) => console.error("workflow schedule dispatcher failed", error)), 10_000).unref();
+  setInterval(() => void cleanupEmptyWorkflowVoiceChannels(client).catch((error) => console.error("workflow voice cleanup failed", error)), 30_000).unref();
   void dispatchGiveawayNotifications().catch((error) => console.error("initial giveaway notification dispatch failed", error));
   void dispatchWorkflowSchedules(client).catch((error) => console.error("initial workflow schedule dispatch failed", error));
+  void cleanupEmptyWorkflowVoiceChannels(client).catch((error) => console.error("initial workflow voice cleanup failed", error));
 });
 
 const rest = client.rest;

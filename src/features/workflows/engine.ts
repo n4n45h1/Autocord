@@ -1,18 +1,22 @@
 import { randomUUID } from "node:crypto";
 import {
-  ActionRowBuilder, ButtonStyle, MessageFlags, ModalBuilder, PermissionFlagsBits, TextInputBuilder, TextInputStyle,
-  type ButtonInteraction, type Client, type Guild, type GuildMember, type Interaction, type ModalSubmitInteraction, type StringSelectMenuInteraction,
+  ActionRowBuilder, ButtonStyle, ChannelType, MessageFlags, ModalBuilder, PermissionFlagsBits, TextInputBuilder, TextInputStyle,
+  type ButtonInteraction, type Client, type Guild, type GuildMember, type Interaction, type ModalSubmitInteraction, type StringSelectMenuInteraction, type VoiceState,
 } from "discord.js";
 import { and, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import { db } from "../../db/client.js";
-import { agentJobSteps, agentJobs, auditEvents, giveawayEntries, interactiveWorkflowRevisions, interactiveWorkflows, managedRoles, workflowEntries, workflowRuns, workflowStates, workflowSchedules } from "../../db/schema.js";
+import { agentJobSteps, agentJobs, auditEvents, giveaways, giveawayEntries, giveawayNotifications, interactiveWorkflowRevisions, interactiveWorkflows, managedChannels, managedRoles, workflowEntries, workflowRuns, workflowStates, workflowSchedules, workflowVoiceChannels } from "../../db/schema.js";
 import { interactiveWorkflowSchema, orderInteractiveWorkflowSteps, type InteractiveWorkflow, type InteractiveWorkflowStep } from "../../agent/interactive-workflow.js";
 import { assertSelfAssignableRole } from "../../policy.js";
 import { withGuildAdvisoryLock } from "../../jobs/claim.js";
 import { evaluateWorkflowCondition, renderWorkflowTemplate } from "./conditions.js";
 import { renderInteractiveWorkflow } from "./render.js";
+import { drawWinners, giveawayResultMessage } from "../giveaways/draw.js";
 
 type WorkflowRecord = typeof interactiveWorkflows.$inferSelect;
+type WorkflowVoiceSession = typeof workflowVoiceChannels.$inferSelect;
+type WorkflowVoiceContext = { sourceChannelId: string; memberCount: number; session: WorkflowVoiceSession | null };
+const workflowPermissionNames = ["ManageGuild", "ManageRoles", "ManageChannels", "Administrator"] as const;
 
 export async function publishInteractiveWorkflow(input: {
   jobId: string;
@@ -162,13 +166,14 @@ async function workflowView(workflowId: string, guild: Guild, member?: GuildMemb
     or(and(eq(workflowStates.scope, "workflow"), eq(workflowStates.scopeId, workflowId)), and(eq(workflowStates.scope, "guild"), eq(workflowStates.scopeId, guild.id)), ...(member ? [and(eq(workflowStates.scope, "member"), eq(workflowStates.scopeId, member.id))] : [])),
   ));
   const states = Object.fromEntries(stateRows.map((row) => [`${row.scope}:${row.key}`, row.value]));
+  const permissions = new Set(workflowPermissionNames.filter((permission) => member?.permissions.has(PermissionFlagsBits[permission])));
   return {
     spec,
     view: {
       entries,
       states,
       roleNames: new Set(member?.roles.cache.map((role) => role.name) ?? []),
-      permissions: new Set(member?.permissions.toArray() ?? []),
+      permissions,
       ...(inputs ? { inputs } : {}),
       ...(selected ? { selected } : {}),
       ...(member ? { actorId: member.id } : {}),
@@ -208,13 +213,81 @@ async function loadManagedRole(guildId: string, guild: Guild, roleName: string) 
   return matches[0]!;
 }
 
-async function evaluateStepCondition(step: InteractiveWorkflowStep, workflowId: string, guild: Guild, member: GuildMember | undefined, inputs: Record<string, string>, selected: readonly string[], results: Record<string, unknown>): Promise<boolean> {
-  if (!step.when) return true;
-  const context = await workflowView(workflowId, guild, member, inputs, selected);
-  return evaluateWorkflowCondition(step.when, { ...context.view, results });
+async function findWorkflowOwnedRole(workflow: WorkflowRecord, guild: Guild, name: string) {
+  const bindings = await db.select({ roleId: managedRoles.roleId }).from(managedRoles).where(and(eq(managedRoles.guildId, workflow.guildId), eq(managedRoles.ownerJobId, workflow.id)));
+  for (const binding of bindings) {
+    const role = guild.roles.cache.get(binding.roleId) ?? await guild.roles.fetch(binding.roleId).catch(() => null);
+    if (role?.name === name) return role;
+  }
+  return null;
 }
 
-async function executeWorkflowStep(workflow: WorkflowRecord, step: InteractiveWorkflowStep, guild: Guild, member: GuildMember | undefined, inputs: Record<string, string>, selected: readonly string[], results: Record<string, unknown>): Promise<unknown> {
+async function findWorkflowOwnedChannel(workflow: WorkflowRecord, guild: Guild, name: string, kind: "category" | "text", parentId?: string | null) {
+  const bindings = await db.select({ channelId: managedChannels.channelId }).from(managedChannels).where(and(eq(managedChannels.guildId, workflow.guildId), eq(managedChannels.ownerJobId, workflow.id), eq(managedChannels.kind, kind)));
+  for (const binding of bindings) {
+    const channel = guild.channels.cache.get(binding.channelId) ?? await guild.channels.fetch(binding.channelId).catch(() => null);
+    const categoryMatches = kind === "category" ? channel?.type === ChannelType.GuildCategory : channel?.type === ChannelType.GuildText && channel.parentId === (parentId ?? null);
+    if (categoryMatches && channel?.name === name) return channel;
+  }
+  return null;
+}
+
+function workflowResourceLimit(): number {
+  const configured = Number(process.env.MAX_RESOURCES_PER_WORKFLOW ?? 10);
+  return Number.isFinite(configured) ? Math.max(1, Math.min(50, configured)) : 10;
+}
+
+async function workflowOwnedResourceCount(workflow: WorkflowRecord): Promise<number> {
+  const [roles] = await db.select({ count: sql<number>`count(*)::int` }).from(managedRoles).where(and(eq(managedRoles.guildId, workflow.guildId), eq(managedRoles.ownerJobId, workflow.id)));
+  const [channels] = await db.select({ count: sql<number>`count(*)::int` }).from(managedChannels).where(and(eq(managedChannels.guildId, workflow.guildId), eq(managedChannels.ownerJobId, workflow.id)));
+  return (roles?.count ?? 0) + (channels?.count ?? 0);
+}
+
+async function loadWorkflowGiveaway(workflow: WorkflowRecord, giveawayId: string) {
+  const [binding] = await db.select({ value: workflowStates.value }).from(workflowStates).where(and(
+    eq(workflowStates.workflowId, workflow.id), eq(workflowStates.scope, "workflow"), eq(workflowStates.scopeId, workflow.id), eq(workflowStates.key, "active_giveaway_id"),
+  )).limit(1);
+  if (binding?.value !== giveawayId) throw new Error("Giveaway is not the active Giveaway owned by this Workflow.");
+  const [giveaway] = await db.select().from(giveaways).where(and(eq(giveaways.id, giveawayId), eq(giveaways.guildId, workflow.guildId))).limit(1);
+  if (!giveaway) throw new Error("Workflow-owned Giveaway no longer exists.");
+  return giveaway;
+}
+
+async function findActiveVoiceSession(workflowId: string, guildId: string, sourceChannelId: string): Promise<WorkflowVoiceSession | null> {
+  const [session] = await db.select().from(workflowVoiceChannels).where(and(
+    eq(workflowVoiceChannels.workflowId, workflowId), eq(workflowVoiceChannels.guildId, guildId),
+    eq(workflowVoiceChannels.sourceChannelId, sourceChannelId), eq(workflowVoiceChannels.state, "ACTIVE"),
+  )).orderBy(sql`${workflowVoiceChannels.createdAt} desc`).limit(1);
+  return session ?? null;
+}
+
+async function closeVoiceSession(session: WorkflowVoiceSession, guild: Guild, onlyWhenEmpty: boolean): Promise<boolean> {
+  const [owned] = await db.select({ channelId: managedChannels.channelId }).from(managedChannels).where(and(
+    eq(managedChannels.guildId, session.guildId), eq(managedChannels.channelId, session.voiceChannelId), eq(managedChannels.ownerJobId, session.workflowId), eq(managedChannels.kind, "voice"),
+  )).limit(1);
+  if (!owned) throw new Error("Voice channel is not owned by this Workflow.");
+  const channel = guild.channels.cache.get(session.voiceChannelId) ?? await guild.channels.fetch(session.voiceChannelId).catch(() => null);
+  if (channel && channel.type !== ChannelType.GuildVoice) throw new Error("Workflow-owned resource is no longer a Voice Channel.");
+  if (onlyWhenEmpty && channel?.type === ChannelType.GuildVoice && channel.members.size > 0) return false;
+  if (channel) {
+    const bot = guild.members.me;
+    if (!bot || !channel.permissionsFor(bot)?.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot lacks Manage Channels on the Workflow-owned Voice Channel.");
+    await channel.delete(`Empty temporary Voice Channel for Workflow ${session.workflowId}`);
+  }
+  await db.transaction(async (tx) => {
+    await tx.update(workflowVoiceChannels).set({ state: "CLOSED", closedAt: new Date() }).where(and(eq(workflowVoiceChannels.id, session.id), eq(workflowVoiceChannels.state, "ACTIVE")));
+    await tx.delete(managedChannels).where(and(eq(managedChannels.guildId, session.guildId), eq(managedChannels.channelId, session.voiceChannelId), eq(managedChannels.ownerJobId, session.workflowId), eq(managedChannels.kind, "voice")));
+  });
+  return true;
+}
+
+async function evaluateStepCondition(step: InteractiveWorkflowStep, workflowId: string, guild: Guild, member: GuildMember | undefined, inputs: Record<string, string>, selected: readonly string[], results: Record<string, unknown>, voice?: WorkflowVoiceContext): Promise<boolean> {
+  if (!step.when) return true;
+  const context = await workflowView(workflowId, guild, member, inputs, selected);
+  return evaluateWorkflowCondition(step.when, { ...context.view, results, ...(voice ? { voice: { memberCount: voice.memberCount, sessionExists: Boolean(voice.session) } } : {}) });
+}
+
+async function executeWorkflowStep(workflow: WorkflowRecord, step: InteractiveWorkflowStep, guild: Guild, member: GuildMember | undefined, inputs: Record<string, string>, selected: readonly string[], results: Record<string, unknown>, voice?: WorkflowVoiceContext): Promise<unknown> {
   const { view } = await workflowView(workflow.id, guild, member, inputs, selected);
   const templateContext = { ...view, results, inputs, selected, ...(member ? { actorId: member.id } : {}) };
   switch (step.action) {
@@ -256,9 +329,11 @@ async function executeWorkflowStep(workflow: WorkflowRecord, step: InteractiveWo
       return { roleId: role.id, granted: grant };
     }
     case "message.send": {
-      const channel = await guild.channels.fetch(workflow.channelId);
-      if (!channel?.isSendable()) throw new Error("Workflow target channel is not sendable.");
       const content = renderWorkflowTemplate(step.content, templateContext);
+      const channel = step.delivery === "workflow_owner_dm"
+        ? await (await guild.members.fetch(workflow.ownerId)).createDM()
+        : await guild.channels.fetch(workflow.channelId);
+      if (!channel || !channel.isSendable()) throw new Error("Workflow message delivery target is not sendable.");
       const message = await channel.send({ content, allowedMentions: { parse: [] } });
       return { messageId: message.id };
     }
@@ -271,10 +346,175 @@ async function executeWorkflowStep(workflow: WorkflowRecord, step: InteractiveWo
     case "panel.refresh":
       await refreshWorkflowPanel(workflow, guild, member, inputs, selected);
       return { panelUpdated: true };
+    case "voice.channel.create": {
+      if (!voice || !member) throw new Error("Voice channel creation requires a VoiceState join event.");
+      const source = await guild.channels.fetch(voice.sourceChannelId);
+      if (!source || source.type !== ChannelType.GuildVoice) throw new Error("Configured Voice Lobby no longer exists.");
+      const configuredLimit = Number(process.env.MAX_VOICE_MOVE_MEMBERS_PER_TRIGGER ?? 20);
+      const moveLimit = Number.isFinite(configuredLimit) ? Math.max(1, Math.min(50, configuredLimit)) : 20;
+      const currentMembers = [...source.members.values()].filter((voiceMember) => !voiceMember.user.bot);
+      if (step.moveMembers && currentMembers.length > moveLimit) throw new Error(`Voice Lobby has ${currentMembers.length} members; per-trigger move limit is ${moveLimit}.`);
+      let session = await findActiveVoiceSession(workflow.id, workflow.guildId, source.id);
+      let target = session ? await guild.channels.fetch(session.voiceChannelId).catch(() => null) : null;
+      let createdNew = false;
+      if (session && target?.type === ChannelType.GuildVoice) {
+        const [binding] = await db.select({ channelId: managedChannels.channelId }).from(managedChannels).where(and(eq(managedChannels.guildId, workflow.guildId), eq(managedChannels.channelId, target.id), eq(managedChannels.ownerJobId, workflow.id), eq(managedChannels.kind, "voice"))).limit(1);
+        if (!binding) throw new Error("Existing voice session is not owned by this Workflow.");
+      }
+      if (!target || target.type !== ChannelType.GuildVoice) {
+        if (session) await closeVoiceSession(session, guild, false);
+        const resolvedName = renderWorkflowTemplate(step.name, { ...view, inputs, selected, ...(member ? { actorId: member.id } : {}) });
+        const name = resolvedName.toLocaleLowerCase().normalize("NFKC").replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 90) || `voice-${workflow.id.slice(0, 8)}`;
+        const bot = guild.members.me;
+        const permissions = bot ? source.permissionsFor(bot) : null;
+        if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers])) throw new Error("Bot lacks required permissions in the configured Voice Lobby.");
+        target = await guild.channels.create({
+          name,
+          type: ChannelType.GuildVoice,
+          parent: source.parentId ?? undefined,
+          permissionOverwrites: source.permissionOverwrites.cache.map((overwrite) => ({ id: overwrite.id, allow: overwrite.allow, deny: overwrite.deny, type: overwrite.type })),
+          reason: `Interactive Workflow ${workflow.id}`,
+        });
+        const sessionId = randomUUID();
+        try {
+          await db.transaction(async (tx) => {
+            await tx.insert(managedChannels).values({ guildId: workflow.guildId, channelId: target!.id, ownerJobId: workflow.id, kind: "voice" });
+            await tx.insert(workflowVoiceChannels).values({ id: sessionId, workflowId: workflow.id, guildId: workflow.guildId, sourceChannelId: source.id, voiceChannelId: target!.id, state: "ACTIVE", createdBy: member.id });
+          });
+        } catch (error) {
+          await target.delete(`Rollback failed Workflow voice session ${workflow.id}`).catch(() => undefined);
+          throw error;
+        }
+        session = { id: sessionId, workflowId: workflow.id, guildId: workflow.guildId, sourceChannelId: source.id, voiceChannelId: target.id, state: "ACTIVE", createdBy: member.id, createdAt: new Date(), closedAt: null };
+        createdNew = true;
+      }
+      let moved = 0;
+      if (step.moveMembers) {
+        for (const lobbyMember of currentMembers) {
+          if (lobbyMember.voice.channelId !== target.id) {
+            await lobbyMember.voice.setChannel(target, `Gathered by Interactive Workflow ${workflow.id}`);
+            moved++;
+          }
+        }
+      }
+      if (!session) throw new Error("Workflow Voice session was not persisted.");
+      return { sessionId: session.id, channelId: target.id, created: createdNew, membersMoved: moved };
+    }
+    case "voice.channel.delete": {
+      if (!voice?.session) throw new Error("Voice channel delete requires an active Workflow-managed Voice session.");
+      const closed = await closeVoiceSession(voice.session, guild, true);
+      return { sessionId: voice.session.id, channelId: voice.session.voiceChannelId, deleted: closed };
+    }
+    case "resource.role.create": {
+      if (!member?.permissions.has([PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles])) throw new Error("Role creation trigger requires Manage Server and Manage Roles.");
+      const bot = guild.members.me;
+      if (!bot?.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot lacks Manage Roles for this Workflow action.");
+      const existing = await findWorkflowOwnedRole(workflow, guild, step.name);
+      if (existing) return { roleId: existing.id, name: existing.name, created: false };
+      if (guild.roles.cache.some((role) => role.name === step.name)) throw new Error(`A role with this name already exists and is not owned by this Workflow: ${step.name}`);
+      const resourceLimit = workflowResourceLimit();
+      if (await workflowOwnedResourceCount(workflow) >= resourceLimit) throw new Error(`Workflow resource cap reached (${resourceLimit}).`);
+      const role = await guild.roles.create({ name: step.name, permissions: [], reason: `Interactive Workflow ${workflow.id}` });
+      try { await db.insert(managedRoles).values({ guildId: workflow.guildId, roleId: role.id, ownerJobId: workflow.id }); }
+      catch (error) { await role.delete(`Rollback failed Workflow role ${workflow.id}`).catch(() => undefined); throw error; }
+      return { roleId: role.id, name: role.name, created: true };
+    }
+    case "resource.channel.create_category":
+    case "resource.channel.create_text": {
+      if (!member?.permissions.has([PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageChannels])) throw new Error("Channel creation trigger requires Manage Server and Manage Channels.");
+      const bot = guild.members.me;
+      if (!bot?.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot lacks Manage Channels for this Workflow action.");
+      const name = renderWorkflowTemplate(step.name, templateContext).toLocaleLowerCase().normalize("NFKC").replace(/[^a-z0-9-_]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 90);
+      if (!name) throw new Error("Rendered channel name is empty or invalid.");
+      let parentId: string | null = null;
+      if (step.action === "resource.channel.create_text" && step.categoryStepId) {
+        const dependency = results[step.categoryStepId] as { channelId?: string } | undefined;
+        if (!dependency?.channelId) throw new Error(`Category dependency result is missing: ${step.categoryStepId}`);
+        const [binding] = await db.select({ channelId: managedChannels.channelId }).from(managedChannels).where(and(eq(managedChannels.guildId, workflow.guildId), eq(managedChannels.channelId, dependency.channelId), eq(managedChannels.ownerJobId, workflow.id), eq(managedChannels.kind, "category"))).limit(1);
+        if (!binding) throw new Error("Referenced Category is not owned by this Workflow.");
+        parentId = binding.channelId;
+      }
+      const kind = step.action === "resource.channel.create_category" ? "category" : "text";
+      const existing = await findWorkflowOwnedChannel(workflow, guild, name, kind, parentId);
+      if (existing) return { channelId: existing.id, name: existing.name, created: false };
+      const resourceLimit = workflowResourceLimit();
+      if (await workflowOwnedResourceCount(workflow) >= resourceLimit) throw new Error(`Workflow resource cap reached (${resourceLimit}).`);
+      const topic = step.action === "resource.channel.create_text" && step.topic ? renderWorkflowTemplate(step.topic, templateContext) : undefined;
+      const created = step.action === "resource.channel.create_category"
+        ? await guild.channels.create({ name, type: ChannelType.GuildCategory, reason: `Interactive Workflow ${workflow.id}` })
+        : await guild.channels.create({ name, type: ChannelType.GuildText, topic, parent: parentId ?? undefined, reason: `Interactive Workflow ${workflow.id}` });
+      try { await db.insert(managedChannels).values({ guildId: workflow.guildId, channelId: created.id, ownerJobId: workflow.id, kind }); }
+      catch (error) { await created.delete(`Rollback failed Workflow channel ${workflow.id}`).catch(() => undefined); throw error; }
+      return { channelId: created.id, name: created.name, kind, created: true };
+    }
+    case "giveaway.create": {
+      if (!member?.permissions.has([PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles])) throw new Error("Giveaway creation requires Manage Server and Manage Roles.");
+      const stateRows = await db.select({ value: workflowStates.value }).from(workflowStates).where(and(eq(workflowStates.workflowId, workflow.id), eq(workflowStates.scope, "workflow"), eq(workflowStates.scopeId, workflow.id), eq(workflowStates.key, "active_giveaway_id"))).limit(1);
+      const activeId = typeof stateRows[0]?.value === "string" ? stateRows[0].value : null;
+      if (activeId) {
+        const [active] = await db.select({ id: giveaways.id, state: giveaways.state }).from(giveaways).where(and(eq(giveaways.id, activeId), eq(giveaways.guildId, workflow.guildId))).limit(1);
+        if (active?.state === "ACTIVE" || active?.state === "PAUSED") return { giveawayId: active.id, created: false };
+      }
+      const id = randomUUID();
+      const endsAt = new Date(Date.now() + step.durationSeconds * 1000);
+      await db.transaction(async (tx) => {
+        await tx.insert(giveaways).values({ id, guildId: workflow.guildId, channelId: workflow.channelId, messageId: workflow.messageId, hostId: member.id, prize: step.prize, winnerCount: step.winnerCount, state: "ACTIVE", endsAt });
+        await tx.insert(workflowStates).values({ workflowId: workflow.id, scope: "workflow", scopeId: workflow.id, key: "active_giveaway_id", value: id, updatedAt: new Date() }).onConflictDoUpdate({ target: [workflowStates.workflowId, workflowStates.scope, workflowStates.scopeId, workflowStates.key], set: { value: id, updatedAt: new Date() } });
+        await tx.insert(auditEvents).values({ id: randomUUID(), jobId: workflow.id, guildId: workflow.guildId, actorId: member.id, action: "workflow.giveaway.create", outcome: "success", detail: { giveawayId: id, prize: step.prize, winnerCount: step.winnerCount, endsAt } });
+      });
+      return { giveawayId: id, created: true };
+    }
+    case "giveaway.join":
+    case "giveaway.leave": {
+      if (!member) throw new Error("Giveaway entry actions require an interaction member.");
+      const resolvedId = resolveTemplate(step.giveawayId, templateContext);
+      if (typeof resolvedId !== "string" || !resolvedId) throw new Error("Workflow Giveaway reference did not resolve to an ID.");
+      const giveaway = await loadWorkflowGiveaway(workflow, resolvedId);
+      if (giveaway.state !== "ACTIVE" || giveaway.endsAt.getTime() <= Date.now()) throw new Error("Workflow-owned Giveaway is not accepting entries.");
+      if (step.action === "giveaway.join") {
+        const inserted = await db.insert(giveawayEntries).values({ giveawayId: giveaway.id, userId: member.id }).onConflictDoNothing().returning({ userId: giveawayEntries.userId });
+        return { giveawayId: giveaway.id, joined: inserted.length > 0 };
+      }
+      const removed = await db.delete(giveawayEntries).where(and(eq(giveawayEntries.giveawayId, giveaway.id), eq(giveawayEntries.userId, member.id))).returning({ userId: giveawayEntries.userId });
+      return { giveawayId: giveaway.id, left: removed.length > 0 };
+    }
+    case "giveaway.end":
+    case "giveaway.pause":
+    case "giveaway.resume":
+    case "giveaway.reroll": {
+      if (!member?.permissions.has([PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageRoles])) throw new Error(`${step.action} requires Manage Server and Manage Roles.`);
+      const resolvedId = resolveTemplate(step.giveawayId, templateContext);
+      if (typeof resolvedId !== "string" || !resolvedId) throw new Error("Workflow Giveaway reference did not resolve to an ID.");
+      const giveaway = await loadWorkflowGiveaway(workflow, resolvedId);
+      if (step.action === "giveaway.end") {
+        const [updated] = await db.update(giveaways).set({ endsAt: new Date() }).where(and(eq(giveaways.id, giveaway.id), eq(giveaways.guildId, workflow.guildId), eq(giveaways.state, "ACTIVE"))).returning({ id: giveaways.id });
+        return { giveawayId: giveaway.id, ending: Boolean(updated) };
+      }
+      if (step.action === "giveaway.pause") {
+        const [updated] = await db.update(giveaways).set({ state: "PAUSED", remainingSeconds: sql`GREATEST(0, floor(extract(epoch from ${giveaways.endsAt} - now())))::int` }).where(and(eq(giveaways.id, giveaway.id), eq(giveaways.guildId, workflow.guildId), eq(giveaways.state, "ACTIVE"))).returning({ id: giveaways.id });
+        return { giveawayId: giveaway.id, paused: Boolean(updated) };
+      }
+      if (step.action === "giveaway.resume") {
+        const remainingSeconds = Math.max(1, giveaway.remainingSeconds ?? 1);
+        const [updated] = await db.update(giveaways).set({ state: "ACTIVE", endsAt: new Date(Date.now() + remainingSeconds * 1000), remainingSeconds: null }).where(and(eq(giveaways.id, giveaway.id), eq(giveaways.guildId, workflow.guildId), eq(giveaways.state, "PAUSED"))).returning({ id: giveaways.id });
+        return { giveawayId: giveaway.id, resumed: Boolean(updated) };
+      }
+      if (giveaway.state !== "COMPLETED") throw new Error("Giveaway reroll is only available after drawing completes.");
+      const entries = await db.select({ userId: giveawayEntries.userId }).from(giveawayEntries).where(eq(giveawayEntries.giveawayId, giveaway.id));
+      const previousWinners = new Set((giveaway.winners as string[] | null) ?? []);
+      const winners = drawWinners(entries.map((entry) => entry.userId).filter((userId) => !previousWinners.has(userId)), giveaway.winnerCount);
+      await db.transaction(async (tx) => {
+        const [updated] = await tx.update(giveaways).set({ winners }).where(and(eq(giveaways.id, giveaway.id), eq(giveaways.state, "COMPLETED"))).returning({ id: giveaways.id });
+        if (!updated) throw new Error("Giveaway state changed during reroll.");
+        await tx.insert(giveawayNotifications).values({ id: randomUUID(), giveawayId: giveaway.id, guildId: giveaway.guildId, channelId: giveaway.channelId, content: giveawayResultMessage(giveaway.prize, winners, true), allowedUsers: winners });
+        await tx.insert(auditEvents).values({ id: randomUUID(), jobId: workflow.id, guildId: workflow.guildId, actorId: member.id, action: "workflow.giveaway.reroll", outcome: "success", detail: { giveawayId: giveaway.id, previousWinners: [...previousWinners], winners } });
+      });
+      return { giveawayId: giveaway.id, winners };
+    }
   }
 }
 
-async function runWorkflowTrigger(guild: Guild, interactionId: string, workflow: WorkflowRecord, triggerId: string, member: GuildMember | undefined, inputs: Record<string, string>, selected: readonly string[]): Promise<string> {
+async function runWorkflowTrigger(guild: Guild, interactionId: string, workflow: WorkflowRecord, triggerId: string, member: GuildMember | undefined, inputs: Record<string, string>, selected: readonly string[], voice?: WorkflowVoiceContext): Promise<string> {
   const spec = interactiveWorkflowSchema.parse(workflow.spec);
   const trigger = spec.triggers.find((item) => item.id === triggerId);
   if (!trigger) throw new Error("Workflow trigger no longer exists.");
@@ -289,7 +529,7 @@ async function runWorkflowTrigger(guild: Guild, interactionId: string, workflow:
       const cooldownMs = Number.isFinite(configuredCooldown) ? Math.max(0, Math.min(60_000, configuredCooldown)) : 1000;
       if (cooldownMs > 0) {
         const [recent] = await db.select({ count: sql<number>`count(*)::int` }).from(workflowRuns).where(and(
-          eq(workflowRuns.workflowId, workflow.id), eq(workflowRuns.actorId, member.id), gt(workflowRuns.createdAt, new Date(Date.now() - cooldownMs)),
+          eq(workflowRuns.workflowId, workflow.id), eq(workflowRuns.triggerId, triggerId), eq(workflowRuns.actorId, member.id), gt(workflowRuns.createdAt, new Date(Date.now() - cooldownMs)),
         ));
         if ((recent?.count ?? 0) > 0) throw new Error("Workflow trigger rate limit reached; try again shortly.");
       }
@@ -310,24 +550,44 @@ async function runWorkflowTrigger(guild: Guild, interactionId: string, workflow:
   try {
     const outcomes: unknown[] = [];
     const stepResults: Record<string, unknown> = {};
+    const skippedStepIds: string[] = [];
+    const requiredTriggerPermissions = new Set<bigint>();
+    for (const step of trigger.steps) {
+      if (step.action === "resource.role.create") {
+        requiredTriggerPermissions.add(PermissionFlagsBits.ManageGuild);
+        requiredTriggerPermissions.add(PermissionFlagsBits.ManageRoles);
+      }
+      if (step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text") {
+        requiredTriggerPermissions.add(PermissionFlagsBits.ManageGuild);
+        requiredTriggerPermissions.add(PermissionFlagsBits.ManageChannels);
+      }
+      if (step.action === "giveaway.create" || step.action === "giveaway.end" || step.action === "giveaway.pause" || step.action === "giveaway.resume" || step.action === "giveaway.reroll") {
+        requiredTriggerPermissions.add(PermissionFlagsBits.ManageGuild);
+        requiredTriggerPermissions.add(PermissionFlagsBits.ManageRoles);
+      }
+    }
+    if (requiredTriggerPermissions.size && (!member || !member.permissions.has([...requiredTriggerPermissions]))) throw new Error("This Workflow trigger contains admin resource actions; all required permissions are checked before any step runs.");
     for (const [cursor, step] of orderInteractiveWorkflowSteps(trigger.steps).entries()) {
-      if (!(await evaluateStepCondition(step, workflow.id, guild, member, inputs, selected, stepResults))) {
+      if (!(await evaluateStepCondition(step, workflow.id, guild, member, inputs, selected, stepResults, voice))) {
         outcomes.push({ stepId: step.id, state: "SKIPPED" });
         stepResults[step.id] = { state: "SKIPPED" };
+        skippedStepIds.push(step.id);
         await db.update(workflowRuns).set({ cursor: cursor + 1, result: outcomes, updatedAt: new Date() }).where(eq(workflowRuns.id, runId));
         continue;
       }
       const sendsMessage = step.action === "message.send";
       if (sendsMessage) uncertainSend = true;
-      const result = await executeWorkflowStep(workflow, step, guild, member, inputs, selected, stepResults);
+      const result = await executeWorkflowStep(workflow, step, guild, member, inputs, selected, stepResults, voice);
       stepResults[step.id] = result;
       outcomes.push({ stepId: step.id, state: "COMPLETED", result });
       await db.update(workflowRuns).set({ cursor: cursor + 1, result: outcomes, updatedAt: new Date() }).where(eq(workflowRuns.id, runId));
       if (sendsMessage) uncertainSend = false;
     }
     await db.update(workflowRuns).set({ state: "COMPLETED", result: outcomes, updatedAt: new Date() }).where(and(eq(workflowRuns.id, runId), eq(workflowRuns.state, "RUNNING")));
-      await db.insert(auditEvents).values({ id: randomUUID(), jobId: workflow.id, guildId: workflow.guildId, actorId: member?.id ?? "system", action: "workflow.trigger", outcome: "success", detail: { runId, triggerId, event: trigger.event, componentKey: "componentKey" in trigger ? trigger.componentKey : null } });
-    return `Workflow「${workflow.name}」を実行しました。`;
+    await db.insert(auditEvents).values({ id: randomUUID(), jobId: workflow.id, guildId: workflow.guildId, actorId: member?.id ?? "system", action: "workflow.trigger", outcome: skippedStepIds.length ? "partial" : "success", detail: { runId, triggerId, event: trigger.event, componentKey: "componentKey" in trigger ? trigger.componentKey : null, skippedStepIds } });
+    return skippedStepIds.length
+      ? `Workflow「${workflow.name}」を処理しました。一部の条件付きSkillは実行されませんでした: ${skippedStepIds.join(", ")}`
+      : `Workflow「${workflow.name}」を実行しました。`;
   } catch (error) {
     const recoveryRequired = uncertainSend || Boolean((error as { recoveryRequired?: boolean }).recoveryRequired);
     await db.update(workflowRuns).set({ state: recoveryRequired ? "RECOVERY_REQUIRED" : "FAILED", errorDetail: { message: error instanceof Error ? error.message : "unknown" }, updatedAt: new Date() }).where(and(eq(workflowRuns.id, runId), eq(workflowRuns.state, "RUNNING")));
@@ -387,6 +647,75 @@ export async function dispatchWorkflowSchedules(client: Client): Promise<number>
     }
   }
   return processed;
+}
+
+function humanVoiceMemberCount(voiceChannel: import("discord.js").VoiceChannel | null): number {
+  return voiceChannel?.members.filter((member) => !member.user.bot).size ?? 0;
+}
+
+export async function handleWorkflowVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): Promise<void> {
+  if (oldState.channelId === newState.channelId) return;
+  const guild = newState.guild;
+  const eventWindow = Math.floor(Date.now() / 1000);
+  if (newState.channel?.type === ChannelType.GuildVoice && newState.member && !newState.member.user.bot) {
+    const workflows = await db.select().from(interactiveWorkflows).where(and(eq(interactiveWorkflows.guildId, guild.id), eq(interactiveWorkflows.state, "ACTIVE")));
+    for (const workflow of workflows) {
+      const spec = interactiveWorkflowSchema.parse(workflow.spec);
+      const sourceChannelId = newState.channel.id;
+      const trigger = spec.triggers.find((item) => item.event === "voice.member_join_event" && item.voiceChannelId === sourceChannelId);
+      if (!trigger) continue;
+      const session = await findActiveVoiceSession(workflow.id, guild.id, sourceChannelId);
+      const voice = { sourceChannelId, memberCount: humanVoiceMemberCount(newState.channel), session };
+      const runId = `voice-join:${workflow.id}:${newState.member.id}:${sourceChannelId}:${eventWindow}`;
+      try {
+        await withGuildAdvisoryLock(`workflow:${workflow.id}`, () => runWorkflowTrigger(guild, runId, workflow, trigger.id, newState.member!, {}, [], voice));
+      } catch (error) {
+        console.error(JSON.stringify({ level: "error", event: "workflow.voice_join_failed", workflowId: workflow.id, triggerId: trigger.id, error: error instanceof Error ? error.message : "unknown" }));
+      }
+    }
+  }
+
+  if (oldState.channel?.type !== ChannelType.GuildVoice || !oldState.member || oldState.member.user.bot) return;
+  const sessions = await db.select().from(workflowVoiceChannels).where(and(eq(workflowVoiceChannels.guildId, guild.id), eq(workflowVoiceChannels.voiceChannelId, oldState.channelId!), eq(workflowVoiceChannels.state, "ACTIVE")));
+  for (const session of sessions) {
+    const [workflow] = await db.select().from(interactiveWorkflows).where(and(eq(interactiveWorkflows.id, session.workflowId), eq(interactiveWorkflows.guildId, guild.id), eq(interactiveWorkflows.state, "ACTIVE"))).limit(1);
+    if (!workflow) continue;
+    const spec = interactiveWorkflowSchema.parse(workflow.spec);
+    const trigger = spec.triggers.find((item) => item.event === "voice.member_leave_event");
+    if (!trigger) continue;
+    const channel = oldState.channel ?? await guild.channels.fetch(session.voiceChannelId).catch(() => null);
+    const voice = { sourceChannelId: session.sourceChannelId, memberCount: humanVoiceMemberCount(channel?.type === ChannelType.GuildVoice ? channel : null), session };
+    const runId = `voice-leave:${session.id}:${oldState.member.id}:${eventWindow}`;
+    try {
+      await withGuildAdvisoryLock(`workflow:${workflow.id}`, () => runWorkflowTrigger(guild, runId, workflow, trigger.id, oldState.member!, {}, [], voice));
+    } catch (error) {
+      console.error(JSON.stringify({ level: "error", event: "workflow.voice_leave_failed", workflowId: workflow.id, triggerId: trigger.id, sessionId: session.id, error: error instanceof Error ? error.message : "unknown" }));
+    }
+  }
+}
+
+export async function cleanupEmptyWorkflowVoiceChannels(client: Client): Promise<number> {
+  const sessions = await db.select().from(workflowVoiceChannels).where(eq(workflowVoiceChannels.state, "ACTIVE")).limit(100);
+  let cleaned = 0;
+  for (const session of sessions) {
+    const guild = client.guilds.cache.get(session.guildId);
+    if (!guild) continue;
+    await withGuildAdvisoryLock(`workflow:${session.workflowId}`, async () => {
+      const [current] = await db.select().from(workflowVoiceChannels).where(and(eq(workflowVoiceChannels.id, session.id), eq(workflowVoiceChannels.state, "ACTIVE"))).limit(1);
+      if (!current) return;
+      const channel = guild.channels.cache.get(current.voiceChannelId) ?? await guild.channels.fetch(current.voiceChannelId).catch(() => null);
+      const stale = !channel || channel.type === ChannelType.GuildVoice && current.createdAt.getTime() < Date.now() - 30_000 && channel.members.size === 0;
+      if (!stale) return;
+      try {
+        if (channel && channel.type !== ChannelType.GuildVoice) throw new Error("Managed temporary channel is no longer a Voice Channel.");
+        await closeVoiceSession(current, guild, true);
+        cleaned++;
+      } catch (error) {
+        console.error(JSON.stringify({ level: "error", event: "workflow.voice_cleanup_failed", workflowId: current.workflowId, sessionId: current.id, error: error instanceof Error ? error.message : "unknown" }));
+      }
+    });
+  }
+  return cleaned;
 }
 
 export async function handleInteractiveWorkflowInteraction(interaction: Interaction): Promise<boolean> {

@@ -2,11 +2,14 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { MessageFlags } from "discord.js";
 import { compileInteractiveWorkflow, interactiveWorkflowSchema, orderInteractiveWorkflowSteps } from "../../agent/interactive-workflow.js";
+import { analyzeRequestRequirements, validatePlanTargetAgainstRequest, validateWorkflowAgainstRequest } from "../../agent/requirements.js";
 import { evaluateWorkflowCondition, renderWorkflowTemplate } from "./conditions.js";
 import { renderInteractiveWorkflow } from "./render.js";
 
 const signup = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/valorant-recruitment.json", import.meta.url), "utf8")));
-const onboarding = interactiveWorkflowSchema.parse(JSON.parse(readFileSync(new URL("../../../examples/workflows/onboarding-consent.json", import.meta.url), "utf8")));
+const onboarding = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/onboarding-consent.json", import.meta.url), "utf8")));
+const voiceSession = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/voice-session.json", import.meta.url), "utf8")));
+const resourcesAndGiveaway = compileInteractiveWorkflow(JSON.parse(readFileSync(new URL("../../../examples/workflows/resources-and-giveaway.json", import.meta.url), "utf8")));
 
 describe("generic interactive Workflow definitions", () => {
   it("accepts the recruitment UI/actions without feature-specific schema branches", () => {
@@ -15,6 +18,45 @@ describe("generic interactive Workflow definitions", () => {
 
   it("accepts consent and managed-role grant as a composed onboarding flow", () => {
     expect(onboarding.triggers[0]?.steps.map((step) => step.action)).toEqual(["state.set", "role.grant", "panel.refresh"]);
+  });
+
+  it("composes resource and Giveaway Skills through the same admin/user triggers", () => {
+    const managerGuard = { op: "and", conditions: [{ op: "member.has_permission", permission: "ManageGuild" }, { op: "member.has_permission", permission: "ManageChannels" }] } as const;
+    const definition = compileInteractiveWorkflow({
+      version: 1, name: "Server onboarding and giveaway", title: "Welcome", description: "Configure resources and join the active giveaway.", color: "blue",
+      components: [
+        { key: "configure", kind: "button", label: "Configure", style: "primary", emoji: null, triggerId: "configure-trigger" },
+        { key: "enter", kind: "button", label: "Enter", style: "success", emoji: null, disabledWhen: { op: "state.not_exists", scope: "workflow", key: "active_giveaway_id" }, triggerId: "giveaway-trigger" },
+      ],
+      triggers: [
+        { id: "configure-trigger", event: "button", componentKey: "configure", steps: [
+          { id: "create-role", action: "resource.role.create", name: "Member", when: { op: "and", conditions: [{ op: "member.has_permission", permission: "ManageGuild" }, { op: "member.has_permission", permission: "ManageRoles" }] } },
+          { id: "create-category", action: "resource.channel.create_category", name: "community", when: managerGuard },
+          { id: "create-channel", action: "resource.channel.create_text", name: "welcome", topic: "Welcome", categoryStepId: "create-category", dependsOn: ["create-category"], when: managerGuard },
+          { id: "start-giveaway", action: "giveaway.create", prize: "Game key", durationSeconds: 3600, winnerCount: 1, when: { op: "and", conditions: [{ op: "member.has_permission", permission: "ManageGuild" }, { op: "member.has_permission", permission: "ManageRoles" }] } },
+          { id: "save-giveaway", action: "state.set", scope: "workflow", key: "active_giveaway_id", value: "{{result:start-giveaway:giveawayId}}", dependsOn: ["start-giveaway"] },
+        ] },
+        { id: "giveaway-trigger", event: "button", componentKey: "enter", steps: [{ id: "enter-giveaway", action: "giveaway.join", giveawayId: "{{state:workflow:active_giveaway_id}}" }] },
+      ],
+    });
+    expect(definition.triggers[0]?.steps.map((step) => step.action)).toContain("resource.channel.create_text");
+    expect(definition.triggers[0]?.steps.map((step) => step.action)).toContain("giveaway.create");
+    expect(resourcesAndGiveaway.triggers[0]?.steps.map((step) => step.action)).toContain("resource.role.create");
+    expect(resourcesAndGiveaway.triggers[0]?.steps.map((step) => step.action)).toContain("resource.channel.create_text");
+    expect(resourcesAndGiveaway.triggers[0]?.steps.map((step) => step.action)).toContain("giveaway.create");
+    const request = "Create a permissionless role, category, text channel and Giveaway in the same workflow.";
+    expect(analyzeRequestRequirements(request).unifiedResourceInteraction).toBe(true);
+    expect(validateWorkflowAgainstRequest(request, resourcesAndGiveaway)).toEqual([]);
+    expect(validatePlanTargetAgainstRequest(request, "resources")).not.toHaveLength(0);
+    expect(validatePlanTargetAgainstRequest(request, "interactive")).toHaveLength(0);
+    const unguarded = structuredClone(resourcesAndGiveaway);
+    const categoryStep = unguarded.triggers[0]!.steps.find((step) => step.action === "resource.channel.create_category");
+    if (categoryStep) delete categoryStep.when;
+    expect(interactiveWorkflowSchema.safeParse(unguarded).success).toBe(false);
+    const wrongCategoryReference = structuredClone(resourcesAndGiveaway);
+    const textStep = wrongCategoryReference.triggers[0]!.steps.find((step) => step.action === "resource.channel.create_text");
+    if (textStep?.action === "resource.channel.create_text") textStep.categoryStepId = "missing-category";
+    expect(interactiveWorkflowSchema.safeParse(wrongCategoryReference).success).toBe(false);
   });
 
   it("accepts persistent interval/deadline triggers and rejects member-only scheduled actions", () => {
@@ -30,8 +72,13 @@ describe("generic interactive Workflow definitions", () => {
     ] }).success).toBe(false);
   });
 
+  it("accepts VoiceState join/leave triggers with threshold and empty-channel deletion", () => {
+    expect(voiceSession.triggers.find((trigger) => trigger.event === "voice.member_join_event")?.steps.some((step) => step.action === "voice.channel.create")).toBe(true);
+    expect(voiceSession.triggers.find((trigger) => trigger.event === "voice.member_leave_event")?.steps.some((step) => step.action === "voice.channel.delete")).toBe(true);
+  });
+
   it("binds Modal submit fields to a typed Workflow trigger", () => {
-    const modal = interactiveWorkflowSchema.parse({
+    const modal = compileInteractiveWorkflow({
       version: 1, name: "Reason form", title: "Reason", description: "Describe your request", color: "purple",
       components: [{ key: "reason_form", kind: "modal", label: "Open form", title: "Request", triggerId: "submit_reason", inputs: [{ key: "reason", label: "Reason", placeholder: null, style: "paragraph", required: true, maxLength: 500 }] }],
       triggers: [{ id: "submit_reason", event: "modal_submit", componentKey: "reason_form", steps: [{ id: "save_reason", action: "state.set", scope: "member", key: "request_reason", value: "{{input:reason}}" }] }],
@@ -55,7 +102,7 @@ describe("generic interactive Workflow definitions", () => {
     const withResult = structuredClone(signup);
     withResult.triggers[0]!.steps = [
       { id: "register", dependsOn: [], action: "entry.join", collection: "participants", maxEntries: 5 },
-      { id: "notify", dependsOn: ["register"], action: "message.send", content: "Count {{result:register:count}}" },
+      { id: "notify", dependsOn: ["register"], action: "message.send", delivery: "workflow_channel", content: "Count {{result:register:count}}" },
       { id: "refresh", dependsOn: ["register"], action: "panel.refresh" },
     ];
     expect(interactiveWorkflowSchema.safeParse(withResult).success).toBe(true);

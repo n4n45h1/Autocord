@@ -6,16 +6,30 @@ const conditionLeaf = z.discriminatedUnion("op", [
   z.object({ op: z.literal("entries.lt"), collection: key, value: z.number().int().min(0).max(1000) }).strict(),
   z.object({ op: z.literal("entries.gte"), collection: key, value: z.number().int().min(0).max(1000) }).strict(),
   z.object({ op: z.literal("state.equals"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
+  z.object({ op: z.literal("state.exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
+  z.object({ op: z.literal("state.not_exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ op: z.literal("member.has_role"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ op: z.literal("member.has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "Administrator"]) }).strict(),
   z.object({ op: z.literal("time.within"), startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict().refine((condition) => Date.parse(condition.endAt) > Date.parse(condition.startAt), "time.within endAt must follow startAt"),
   z.object({ op: z.literal("result.equals"), stepId: key, field: key, value: scalar }).strict(),
+  z.object({ op: z.literal("voice.members.gte"), value: z.number().int().min(1).max(99) }).strict(),
+  z.object({ op: z.literal("voice.members.eq"), value: z.number().int().min(0).max(99) }).strict(),
+  z.object({ op: z.literal("voice.session.exists") }).strict(),
 ]);
 
 export const workflowConditionSchema = z.union([
   conditionLeaf,
   z.object({ op: z.enum(["and", "or"]), conditions: z.array(conditionLeaf).min(2).max(8) }).strict(),
 ]);
+
+function conditionUsesVoice(condition: WorkflowCondition): boolean {
+  return condition.op === "voice.members.gte" || condition.op === "voice.members.eq" || condition.op === "voice.session.exists"
+    || ((condition.op === "and" || condition.op === "or") && condition.conditions.some(conditionUsesVoice));
+}
+
+function conditionsOf(condition?: WorkflowCondition) {
+  return !condition ? [] : condition.op === "and" || condition.op === "or" ? condition.conditions : [condition];
+}
 
 const stepBase = { id: key, dependsOn: z.array(key).max(12).default([]), when: workflowConditionSchema.optional() };
 export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
@@ -24,9 +38,21 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("state.set"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
   z.object({ ...stepBase, action: z.literal("role.grant"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("role.revoke"), roleName: z.string().min(1).max(100) }).strict(),
-  z.object({ ...stepBase, action: z.literal("message.send"), content: z.string().min(1).max(1900) }).strict(),
+  z.object({ ...stepBase, action: z.literal("message.send"), delivery: z.enum(["workflow_channel", "workflow_owner_dm"]).default("workflow_channel"), content: z.string().min(1).max(1900) }).strict(),
   z.object({ ...stepBase, action: z.literal("message.edit"), content: z.string().max(1900) }).strict(),
   z.object({ ...stepBase, action: z.literal("panel.refresh") }).strict(),
+  z.object({ ...stepBase, action: z.literal("voice.channel.create"), name: z.string().min(1).max(100), moveMembers: z.boolean().default(true) }).strict(),
+  z.object({ ...stepBase, action: z.literal("voice.channel.delete") }).strict(),
+  z.object({ ...stepBase, action: z.literal("resource.role.create"), name: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("resource.channel.create_category"), name: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("resource.channel.create_text"), name: z.string().min(1).max(100), topic: z.string().max(1024).nullable(), categoryStepId: key.nullable() }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.create"), prize: z.string().min(1).max(100), durationSeconds: z.number().int().min(60).max(604800), winnerCount: z.number().int().min(1).max(20) }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.join"), giveawayId: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.leave"), giveawayId: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.end"), giveawayId: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.pause"), giveawayId: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.resume"), giveawayId: z.string().min(1).max(100) }).strict(),
+  z.object({ ...stepBase, action: z.literal("giveaway.reroll"), giveawayId: z.string().min(1).max(100) }).strict(),
 ]);
 
 const buttonComponent = z.object({ key, kind: z.literal("button"), label: z.string().min(1).max(80), style: z.enum(["primary", "secondary", "success", "danger"]), emoji: z.string().max(64).nullable(), disabledWhen: workflowConditionSchema.nullable().optional(), triggerId: key }).strict();
@@ -43,17 +69,19 @@ const modalComponent = z.object({
   inputs: z.array(z.object({ key, label: z.string().min(1).max(45), placeholder: z.string().max(100).nullable(), style: z.enum(["short", "paragraph"]), required: z.boolean(), maxLength: z.number().int().min(1).max(4000) }).strict()).min(1).max(5),
 }).strict();
 
-const triggerSchema = z.discriminatedUnion("event", [
+export const interactiveWorkflowTriggerSchema = z.discriminatedUnion("event", [
   z.object({ id: key, event: z.enum(["button", "select", "modal_submit"]), componentKey: key, steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.literal("schedule"), intervalSeconds: z.number().int().min(60).max(604800), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.literal("deadline"), afterSeconds: z.number().int().min(60).max(2_592_000), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.literal("voice.member_join_event"), voiceChannelId: z.string().regex(/^\d{17,20}$/), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.literal("voice.member_leave_event"), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
 ]);
 
 export const interactiveWorkflowDraftSchema = z.object({
   version: z.literal(1), name: z.string().min(1).max(80), title: z.string().min(1).max(80),
   description: z.string().max(1000), color: z.enum(["blue", "purple", "green", "red", "gray"]),
-  components: z.array(z.discriminatedUnion("kind", [buttonComponent, selectComponent, modalComponent])).min(1).max(5),
-  triggers: z.array(triggerSchema).min(1).max(15),
+  components: z.array(z.discriminatedUnion("kind", [buttonComponent, selectComponent, modalComponent])).max(5),
+  triggers: z.array(interactiveWorkflowTriggerSchema).min(1).max(15),
 }).strict();
 
 export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRefine((workflow, ctx) => {
@@ -66,19 +94,6 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
     if (triggerIds.has(trigger.id)) ctx.addIssue({ code: "custom", message: `Duplicate trigger id: ${trigger.id}` });
     triggerIds.add(trigger.id);
     totalSteps += trigger.steps.length;
-    if (trigger.event === "schedule" || trigger.event === "deadline") {
-      for (const step of trigger.steps) {
-        if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke") ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member-scoped action ${step.action}.` });
-        if (step.action === "state.set" && step.scope === "member") ctx.addIssue({ code: "custom", message: "Scheduled triggers may not update member-scoped state." });
-        if (step.when?.op === "member.has_role" || step.when?.op === "member.has_permission" || ((step.when?.op === "and" || step.when?.op === "or") && step.when.conditions.some((condition) => condition.op === "member.has_role" || condition.op === "member.has_permission"))) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate member-only conditions." });
-      }
-      continue;
-    }
-    if (triggerKeys.has(trigger.componentKey)) ctx.addIssue({ code: "custom", message: `Only one trigger may bind to component ${trigger.componentKey}.` });
-    triggerKeys.add(trigger.componentKey);
-    const component = componentByKey.get(trigger.componentKey);
-    const expected = component?.kind === "button" ? "button" : component?.kind === "select" ? "select" : component?.kind === "modal" ? "modal_submit" : null;
-    if (!component || expected !== trigger.event || component.triggerId !== trigger.id) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} does not match its UI component.` });
     if (new Set(trigger.steps.map((step) => step.id)).size !== trigger.steps.length) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} has duplicate step IDs.` });
     const stepIds = new Set(trigger.steps.map((step) => step.id));
     const stepById = new Map(trigger.steps.map((step) => [step.id, step]));
@@ -97,8 +112,19 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       if (!stepIds.has(dependency)) ctx.addIssue({ code: "custom", message: `Step ${step.id} depends on missing step ${dependency}.` });
       if (dependency === step.id) ctx.addIssue({ code: "custom", message: `Step ${step.id} cannot depend on itself.` });
     }
+    for (const step of trigger.steps) if (step.action === "resource.channel.create_text" && step.categoryStepId) {
+      const categoryStep = stepById.get(step.categoryStepId);
+      if (!categoryStep || categoryStep.action !== "resource.channel.create_category") ctx.addIssue({ code: "custom", message: `Text channel ${step.id} references a missing category step.` });
+      else if (!dependsOnAncestor(step.id, step.categoryStepId)) ctx.addIssue({ code: "custom", message: `Text channel ${step.id} must depend on category step ${step.categoryStepId}.` });
+    }
+    for (const step of trigger.steps) if (step.action === "role.grant" || step.action === "role.revoke") {
+      const createdRole = trigger.steps.find((candidate) => candidate.action === "resource.role.create" && candidate.name === step.roleName);
+      if (createdRole && !dependsOnAncestor(step.id, createdRole.id)) ctx.addIssue({ code: "custom", message: `Role operation ${step.id} must depend on Workflow role creation step ${createdRole.id}.` });
+    }
     for (const step of trigger.steps) {
-      const text = step.action === "state.set" && typeof step.value === "string" ? step.value : step.action === "message.send" || step.action === "message.edit" ? step.content : "";
+      const text = step.action === "state.set" && typeof step.value === "string" ? step.value
+        : step.action === "message.send" || step.action === "message.edit" ? step.content
+          : "giveawayId" in step ? step.giveawayId : "";
       for (const match of text.matchAll(/\{\{result:([a-z0-9._-]{1,40}):[a-z0-9._-]{1,40}\}\}/g)) requireResultDependency(step.id, match[1]!, `Step ${step.id}`);
       const conditions = step.when ? step.when.op === "and" || step.when.op === "or" ? step.when.conditions : [step.when] : [];
       for (const condition of conditions) if (condition.op === "result.equals") requireResultDependency(step.id, condition.stepId, `Condition on ${step.id}`);
@@ -112,6 +138,48 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       }
       for (const step of ready) pending.delete(step.id);
     }
+    const panelMutationSteps = trigger.steps.filter((step) => ["entry.join", "entry.leave", "state.set", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
+    if (panelMutationSteps.length) {
+      const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
+      if (!refresh) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} must refresh its UI after changing Workflow-visible state/resources.` });
+      else for (const mutation of panelMutationSteps) if (!dependsOnAncestor(refresh.id, mutation.id)) ctx.addIssue({ code: "custom", message: `Panel refresh in ${trigger.id} must depend on mutation ${mutation.id}.` });
+    }
+    if (trigger.event === "schedule" || trigger.event === "deadline") {
+      for (const step of trigger.steps) {
+        if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke" || step.action === "voice.channel.create" || step.action === "voice.channel.delete" || step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway.")) ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member/resource action ${step.action}.` });
+        if (step.action === "state.set" && step.scope === "member") ctx.addIssue({ code: "custom", message: "Scheduled triggers may not update member-scoped state." });
+        if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate VoiceState conditions." });
+        if (step.when?.op === "member.has_role" || step.when?.op === "member.has_permission" || ((step.when?.op === "and" || step.when?.op === "or") && step.when.conditions.some((condition) => condition.op === "member.has_role" || condition.op === "member.has_permission"))) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate member-only conditions." });
+      }
+      continue;
+    }
+    if (trigger.event === "voice.member_join_event" || trigger.event === "voice.member_leave_event") {
+      const expectedAction = trigger.event === "voice.member_join_event" ? "voice.channel.create" : "voice.channel.delete";
+      const forbiddenAction = trigger.event === "voice.member_join_event" ? "voice.channel.delete" : "voice.channel.create";
+      if (!trigger.steps.some((step) => step.action === expectedAction)) ctx.addIssue({ code: "custom", message: `${trigger.event} must use ${expectedAction}.` });
+      if (trigger.steps.some((step) => step.action === forbiddenAction)) ctx.addIssue({ code: "custom", message: `${trigger.event} cannot use ${forbiddenAction}.` });
+      if (trigger.steps.some((step) => step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway."))) ctx.addIssue({ code: "custom", message: "Resource and giveaway management actions are only available on explicit component/modal triggers." });
+      continue;
+    }
+    for (const step of trigger.steps) {
+      if (step.action === "voice.channel.create" || step.action === "voice.channel.delete") ctx.addIssue({ code: "custom", message: "Voice channel actions require VoiceState event triggers." });
+      if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "VoiceState conditions require VoiceState event triggers." });
+      const requiredPermission = step.action === "resource.role.create" ? "ManageRoles"
+        : step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" ? "ManageChannels"
+          : step.action === "giveaway.create" || step.action === "giveaway.end" || step.action === "giveaway.reroll" || step.action === "giveaway.pause" || step.action === "giveaway.resume" ? "ManageRoles"
+          : null;
+      if (requiredPermission) {
+        const conditions = conditionsOf(step.when);
+        if (step.when?.op !== "and") ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must use an AND permission guard.` });
+        if (!conditions.some((condition) => condition.op === "member.has_permission" && condition.permission === "ManageGuild")) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with member.has_permission ManageGuild.` });
+        if (!conditions.some((condition) => condition.op === "member.has_permission" && condition.permission === requiredPermission)) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with member.has_permission ${requiredPermission}.` });
+      }
+    }
+    if (triggerKeys.has(trigger.componentKey)) ctx.addIssue({ code: "custom", message: `Only one trigger may bind to component ${trigger.componentKey}.` });
+    triggerKeys.add(trigger.componentKey);
+    const component = componentByKey.get(trigger.componentKey);
+    const expected = component?.kind === "button" ? "button" : component?.kind === "select" ? "select" : component?.kind === "modal" ? "modal_submit" : null;
+    if (!component || expected !== trigger.event || component.triggerId !== trigger.id) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} does not match its UI component.` });
     if (component && (component.kind === "button" || component.kind === "select")) {
       for (const step of trigger.steps) if (step.action === "entry.join") {
         const disabledWhen = component.disabledWhen;
@@ -121,6 +189,15 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
             ? disabledWhen.conditions.some((condition) => condition.op === "entries.gte" && condition.collection === step.collection && condition.value === step.maxEntries)
             : false);
         if (!hasCapacityGuard) ctx.addIssue({ code: "custom", message: `Join component ${component.key} must disable at the ${step.maxEntries}-entry cap.` });
+      }
+      for (const step of trigger.steps) if (step.action === "giveaway.join") {
+        const disabledWhen = component.disabledWhen;
+        const hasGiveawayGuard = disabledWhen && (disabledWhen.op === "state.not_exists"
+          ? disabledWhen.scope === "workflow" && disabledWhen.key === "active_giveaway_id"
+          : disabledWhen.op === "and" || disabledWhen.op === "or"
+            ? disabledWhen.conditions.some((condition) => condition.op === "state.not_exists" && condition.scope === "workflow" && condition.key === "active_giveaway_id")
+            : false);
+        if (!hasGiveawayGuard) ctx.addIssue({ code: "custom", message: `Giveaway join component ${component.key} must disable until active_giveaway_id exists.` });
       }
     }
     const entrySteps = trigger.steps.filter((step) => step.action === "entry.join" || step.action === "entry.leave");
@@ -145,17 +222,16 @@ export function compileInteractiveWorkflow(input: unknown): InteractiveWorkflow 
   const compiled = structuredClone(workflow);
   const collections = new Set<string>();
   for (const trigger of compiled.triggers) {
-    const hasEntries = trigger.steps.some((step) => step.action === "entry.join" || step.action === "entry.leave");
+    const mutationStepIds = trigger.steps.filter((step) => ["entry.join", "entry.leave", "state.set", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
     for (const step of trigger.steps) if (step.action === "entry.join" || step.action === "entry.leave") collections.add(step.collection);
-    const entryStepIds = trigger.steps.filter((step) => step.action === "entry.join" || step.action === "entry.leave").map((step) => step.id);
     const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
-    if (refresh) refresh.dependsOn = [...new Set([...refresh.dependsOn, ...entryStepIds])];
-    if (hasEntries && !trigger.steps.some((step) => step.action === "panel.refresh")) {
+    if (refresh) refresh.dependsOn = [...new Set([...refresh.dependsOn, ...mutationStepIds])];
+    if (mutationStepIds.length && !trigger.steps.some((step) => step.action === "panel.refresh")) {
       const baseId = `refresh-${trigger.id}`.slice(0, 40);
       let id = baseId;
       let suffix = 1;
       while (trigger.steps.some((step) => step.id === id)) id = `${baseId.slice(0, 37)}-${suffix++}`;
-      trigger.steps.push({ id, action: "panel.refresh", dependsOn: entryStepIds });
+      trigger.steps.push({ id, action: "panel.refresh", dependsOn: mutationStepIds });
     }
   }
   const missingCounts = [...collections].filter((collection) => !compiled.description.includes(`{{entries:${collection}:count}}`));

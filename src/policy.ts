@@ -40,6 +40,18 @@ const interactiveActionSkills: Record<InteractiveWorkflowStep["action"], AgentSk
   "message.send": "workflow.message.send",
   "message.edit": "workflow.message.edit",
   "panel.refresh": "workflow.panel.refresh",
+  "voice.channel.create": "workflow.voice.channel.create",
+  "voice.channel.delete": "workflow.voice.channel.delete",
+  "resource.role.create": "workflow.resource.role.create",
+  "resource.channel.create_category": "workflow.resource.channel.create_category",
+  "resource.channel.create_text": "workflow.resource.channel.create_text",
+  "giveaway.create": "workflow.giveaway.create",
+  "giveaway.join": "workflow.giveaway.join",
+  "giveaway.leave": "workflow.giveaway.leave",
+  "giveaway.end": "workflow.giveaway.end",
+  "giveaway.pause": "workflow.giveaway.pause",
+  "giveaway.resume": "workflow.giveaway.resume",
+  "giveaway.reroll": "workflow.giveaway.reroll",
 };
 
 export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: InteractiveWorkflow, actor: GuildMember): void {
@@ -47,14 +59,24 @@ export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: Int
   assertSkillPermissions("workflow.publish", actor);
   const bot = guild.members.me;
   if (!bot) throw new Error("Bot guild member could not be resolved.");
-  for (const trigger of workflow.triggers) for (const step of trigger.steps) {
-    const skillId = interactiveActionSkills[step.action];
-    assertSkillPermissions(skillId, actor);
-    if (step.action === "role.grant" || step.action === "role.revoke") {
-      if (!bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for this Workflow.");
-    }
-    if (step.action === "message.send" || step.action === "message.edit" || step.action === "panel.refresh") {
-      if (!bot.permissions.has(PermissionFlagsBits.SendMessages)) throw new Error("Bot needs Send Messages for this Workflow.");
+  for (const trigger of workflow.triggers) {
+    if (trigger.event === "voice.member_join_event") assertSkillPermissions("workflow.voice.member_join_event", actor);
+    if (trigger.event === "voice.member_leave_event") assertSkillPermissions("workflow.voice.member_leave_event", actor);
+    for (const step of trigger.steps) {
+      const skillId = interactiveActionSkills[step.action];
+      assertSkillPermissions(skillId, actor);
+      if (step.action === "role.grant" || step.action === "role.revoke") {
+        if (!bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for this Workflow.");
+      }
+      if (step.action === "message.send" || step.action === "message.edit" || step.action === "panel.refresh") {
+        if (!bot.permissions.has(PermissionFlagsBits.SendMessages)) throw new Error("Bot needs Send Messages for this Workflow.");
+      }
+      if (step.action === "voice.channel.create" || step.action === "voice.channel.delete") {
+        if (!bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for Voice Workflow actions.");
+        if (step.action === "voice.channel.create" && !bot.permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error("Bot needs Move Members to gather the lobby occupants in a temporary voice channel.");
+      }
+      if (step.action === "resource.role.create" && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for Workflow role creation.");
+      if ((step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text") && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for Workflow channel creation.");
     }
   }
 }

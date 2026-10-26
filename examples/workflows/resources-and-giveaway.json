@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "name": "Server setup and giveaway",
+  "title": "Community setup",
+  "description": "Admin configures a permissionless Member role, category/text channel and Giveaway. Members can enter or cancel. Active giveaway: {{state:workflow:active_giveaway_id}}",
+  "color": "purple",
+  "components": [
+    { "key": "setup", "kind": "button", "label": "Admin: Configure", "style": "primary", "emoji": null, "triggerId": "setup-trigger" },
+    { "key": "enter", "kind": "button", "label": "Enter giveaway", "style": "success", "emoji": null, "disabledWhen": { "op": "state.not_exists", "scope": "workflow", "key": "active_giveaway_id" }, "triggerId": "enter-trigger" },
+    { "key": "leave", "kind": "button", "label": "Cancel entry", "style": "secondary", "emoji": null, "triggerId": "leave-trigger" }
+  ],
+  "triggers": [
+    {
+      "id": "setup-trigger",
+      "event": "button",
+      "componentKey": "setup",
+      "steps": [
+        {
+          "id": "create-member-role",
+          "action": "resource.role.create",
+          "name": "Member",
+          "when": { "op": "and", "conditions": [{ "op": "member.has_permission", "permission": "ManageGuild" }, { "op": "member.has_permission", "permission": "ManageRoles" }] }
+        },
+        {
+          "id": "create-category",
+          "action": "resource.channel.create_category",
+          "name": "community",
+          "when": { "op": "and", "conditions": [{ "op": "member.has_permission", "permission": "ManageGuild" }, { "op": "member.has_permission", "permission": "ManageChannels" }] }
+        },
+        {
+          "id": "create-welcome-channel",
+          "action": "resource.channel.create_text",
+          "name": "welcome",
+          "topic": "Community welcome channel",
+          "categoryStepId": "create-category",
+          "dependsOn": ["create-category"],
+          "when": { "op": "and", "conditions": [{ "op": "member.has_permission", "permission": "ManageGuild" }, { "op": "member.has_permission", "permission": "ManageChannels" }] }
+        },
+        {
+          "id": "start-giveaway",
+          "action": "giveaway.create",
+          "prize": "Game key",
+          "durationSeconds": 3600,
+          "winnerCount": 1,
+          "when": { "op": "and", "conditions": [{ "op": "member.has_permission", "permission": "ManageGuild" }, { "op": "member.has_permission", "permission": "ManageRoles" }] }
+        },
+        { "id": "store-giveaway", "action": "state.set", "scope": "workflow", "key": "active_giveaway_id", "value": "{{result:start-giveaway:giveawayId}}", "dependsOn": ["start-giveaway"] },
+        { "id": "refresh", "action": "panel.refresh", "dependsOn": ["create-member-role", "create-welcome-channel", "store-giveaway"] }
+      ]
+    },
+    {
+      "id": "enter-trigger",
+      "event": "button",
+      "componentKey": "enter",
+      "steps": [{ "id": "join-giveaway", "action": "giveaway.join", "giveawayId": "{{state:workflow:active_giveaway_id}}" }]
+    },
+    {
+      "id": "leave-trigger",
+      "event": "button",
+      "componentKey": "leave",
+      "steps": [{ "id": "leave-giveaway", "action": "giveaway.leave", "giveawayId": "{{state:workflow:active_giveaway_id}}" }]
+    }
+  ]
+}

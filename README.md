@@ -34,22 +34,25 @@ npm run commands:deploy
 npm run dev
 ```
 
-The Bot needs `Guilds`, `Manage Roles`, `Manage Guild`, message send/history permissions. Guild-member privileged intent is not requested. Keep the Bot role above roles it creates. In Docker Compose, the Bot container applies the idempotent SQL migration before starting.
+The Bot needs `Guilds`, `Manage Roles`, `Manage Guild`, message send/history permissions. Voice Workflow actions additionally need the `GuildVoiceStates` intent and `Manage Channels`, `Move Members`, `Connect`, and `View Channel` permissions in the selected Lobby. Guild-member privileged intent is not requested. Keep the Bot role above roles it creates. In Docker Compose, the Bot container applies the idempotent SQL migration before starting.
 
 For the no-key OpenCode backend, run the Bot natively so it can reach the authenticated loopback OpenCode server. Full Compose Bot runtime defaults to the OpenAI-compatible backend (`AI_BACKEND_DOCKER=openai-compatible`) because a container's loopback cannot reach the host OpenCode service; provide that backend's endpoint/key or run only `docker compose up -d postgres` and start the Bot natively. Deploy commands with `npm run commands:deploy` from a shell with the Discord token in its environment.
 
 ## Alpha Limits / Not Implemented
 
-- Agentcord Max has three disjoint targets: up to eight operations for one panel, up to eight role/channel creation steps, or one Interactive Workflow definition. Resource and Interactive Workflow publication cannot be mixed with panel mutations or each other in one job; autonomous replanning is not implemented.
-- Interactive Workflow creation is available as Max target `interactive`. `examples/workflows/valorant-recruitment.json` composes a capped unique-entry collection, join/cancel triggers, a live participant count and a disabled-at-cap button; `examples/workflows/onboarding-consent.json` composes member consent state and a managed-role grant. Both use the same schema, interpreter, DB state and Components V2 renderer; no feature-name branch exists in runtime execution.
+- Agentcord Max has three disjoint planning targets: one-shot operations on a role panel, a role/channel resource batch, or an Interactive Workflow definition. The published Interactive Workflow engine can then compose typed resource-create and Giveaway actions with UI, state and triggers; it does not execute arbitrary model-provided API calls.
+- Interactive Workflow creation is available as Max target `interactive`. `examples/workflows/valorant-recruitment.json` composes capped unique entries and count-refresh UI; `examples/workflows/onboarding-consent.json` composes member consent state and managed-role assignment; `examples/workflows/voice-session.json` composes VoiceState join/leave triggers, temporary VC creation/member moves and empty-channel deletion. All use the same schema and interpreter.
+- The same trigger graph can compose permissionless Role creation, default-permission Category/Text Channel creation, and Giveaway create/join/leave/end/pause/resume/reroll actions. Resource and Giveaway management actions require an AND permission guard in the definition and recheck the triggering member at execution. Text Channels may depend on a Category step; Giveaway IDs can flow through state/result references. `examples/workflows/resources-and-giveaway.json` combines these operations in one definition.
+- `voice-session.json` contains a nonfunctional placeholder Lobby ID. Max uses the guild's existing Voice Channel list, asks which Lobby when ambiguous, validates the selected ID/type/permissions, and only manages temporary VCs it created for that Workflow.
 - Component, Modal, recurring interval and deadline triggers are implemented. Nested condition trees, automatic Workflow discovery without choosing a workflow_id, and arbitrary cross-workflow calls are not implemented.
-- Natural language can create/edit panels and can create/edit a selected Interactive Workflow using the `workflow_id` autocomplete option. Role/Channel resource creation is available through Max. Giveaway operations use `/giveaway`; AI-generated Giveaway plans and Giveaway notification deduplication are not implemented.
-- Role/channel editing or deletion, permission-overwrite design, panel deletion, mixing panel edits with guild resource creation in one workflow, configurable guild settings UI, pages beyond the 25-item Discord select/list limits, and cross-server dashboard are not implemented.
+- Natural language can create/edit panels and can create/edit a selected Interactive Workflow using the `workflow_id` autocomplete option. Role/Channel creation and Giveaway behavior can be composed into Interactive Workflows. `/giveaway` remains for existing direct administration; autonomous Giveaway plans outside a typed Workflow are not implemented.
+- Role/channel editing or deletion, permission-overwrite design, role-panel deletion/edit actions inside Interactive Workflow, configurable guild settings UI, pages beyond the 25-item Discord select/list limits, and cross-server dashboard are not implemented.
+- Read-only utility Skills (`role.list`, `channel.list`, `usage.read`, `audit.list`, `job.status`) and the legacy role-panel `undo`/option-edit operations remain on their current slash/Max-plan paths rather than becoming event-triggered Workflow steps.
 - Job execution is serialized, claimed, and recoverable. A process crash after Discord effects but before DB commit is recorded for operator recovery; automatic external-state reconciliation is intentionally not guessed.
 - Panel publication attempts to compensate newly created roles if the message/DB update fails. Resource workflows preserve already-created resources on partial failure and enter `RECOVERY_REQUIRED` for operator reconciliation.
 - The giveaway scheduler recovers interrupted `DRAWING` rows and retries notification outbox rows with exponential backoff. Delivery is at-least-once: a crash after Discord accepts a message but before the outbox is marked sent can cause a duplicate announcement.
 - Cost is an estimate. Set provider-specific input/output USD-per-million values to nonzero values; defaults are zero because provider rates are not assumed.
-- The Bot Gateway/health and River Max planning were exercised; no test-guild end-to-end Interactive Workflow publish, component/modal interaction, or scheduled execution has been performed.
+- The Bot Gateway/health and River Max planning were exercised; no test-guild end-to-end Interactive Workflow publish, component/Modal interaction, VoiceState event, or scheduled execution has been performed.
 
 ## Configuration
 
@@ -61,12 +64,14 @@ For the no-key OpenCode backend, run the Bot natively so it can reach the authen
 | `AGENTCORD_MAX_MODEL` | `river/deepseek-v4.1-flash` | Max provider/model ID |
 | `OPENAI_COMPATIBLE_BASE_URL` | `https://api.opencode.ai/v1` | OpenAI-compatible endpoint when selected |
 | `AI_FALLBACK_MODEL` | empty | One fallback model after a primary failure |
-| `MINI_MONTHLY_LIMIT` / `MAX_MONTHLY_LIMIT` | `30` / `5` | Per-guild monthly request limits |
+| `MINI_MONTHLY_LIMIT` / `MAX_MONTHLY_LIMIT` | `0` / `0` | Per-guild monthly limits; `0` means unlimited |
 | `MAX_CONCURRENT_JOBS_PER_GUILD` | `1` | Guild-local pending/executing job cap |
 | `MAX_CONCURRENT_AI_JOBS` | `5` | Global pending/executing AI job cap |
 | `MAX_CONCURRENT_WORKFLOW_RUNS` | `20` | Global Interactive Workflow run cap (clamped 1..100) |
 | `WORKFLOW_TRIGGER_COOLDOWN_MS` | `1000` | Per-member, per-Workflow trigger cooldown |
 | `MAX_ACTIVE_WORKFLOWS_PER_GUILD` | `50` | Guild-local active definition storage cap (clamped 1..500) |
+| `MAX_VOICE_MOVE_MEMBERS_PER_TRIGGER` | `20` | Maximum humans moved from a Voice Lobby by one temporary-channel trigger (clamped 1..50) |
+| `MAX_RESOURCES_PER_WORKFLOW` | `10` | Maximum Workflow-owned Roles/Channels created by runtime actions (clamped 1..50) |
 | `APPROVAL_TTL_MINUTES` | `10` | Preview expiry |
 | `AI_INPUT_USD_PER_MILLION` / `AI_OUTPUT_USD_PER_MILLION` | `0` | Cost estimate rates |
 
@@ -87,3 +92,5 @@ npm audit
 Agentcord Max can propose an `interactive` target that defines a Components V2 panel, button/select/modal triggers, bounded AND/OR conditions, and ordered actions. The same interpreter handles entry caps, user/workflow state, managed-role assignment, notifications, and panel refresh. `examples/workflows/valorant-recruitment.json` and `examples/workflows/onboarding-consent.json` demonstrate composition without feature-specific runtime branches.
 
 Published definitions and interaction runs are guild-scoped and versioned; interval/deadline triggers use a persistent lease-backed schedule table, interaction IDs deduplicate runs and entry rows use a database unique key. Max can create and version-edit an Interactive Workflow by selecting its guild-scoped `workflow_id` and describing the change in Japanese. This build has unit/schema and PostgreSQL integration coverage but has not been exercised against a live Discord test guild for the Workflow interaction paths.
+
+Max request analysis/validation now checks inquiry forms, capped recruitment and voice-channel lifecycle requirements against the generated target and actions before approval. Inquiry forms require a Modal, member-scoped field persistence and owner-DM delivery; submitted fields are rejected from public panel/channel messages. Voice-channel creation/member lifecycle/deletion is not implemented, so those requests report the missing Skills and do not publish a recruitment-only substitute. Clarification requests with missing Skills have no approval path; supported clarification questions open an answer Modal and then replan. Mini directs multi-trigger requests to Max instead of converting them into role panels.

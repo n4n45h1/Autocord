@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { panelPlanSchema, type PanelPlan } from "../plan.js";
 import { maxWorkflowSchema, resourceWorkflowSchema, resourceSkillId, type MaxWorkflow, type ResourceWorkflow, type ResourceWorkflowStep } from "../workflow.js";
-import { interactiveWorkflowSchema, interactiveWorkflowStepSchema } from "../interactive-workflow.js";
+import { interactiveWorkflowSchema, interactiveWorkflowStepSchema, interactiveWorkflowTriggerSchema } from "../interactive-workflow.js";
 
 const emptyInput = z.object({}).strict();
 const idInput = z.object({ id: z.string().min(1).max(80) }).strict();
@@ -109,6 +109,76 @@ export const agentSkills = {
     inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "panel.refresh", "workflow.panel.refresh requires panel.refresh"),
     requiredPermissions: [], targetScope: "workflow-owned-panel-message", risk: "guild-message-write",
     approval: { required: false, binds: ["workflowId", "messageId", "stepId"] }, effects: ["workflow-panel.render-state"],
+  },
+  "workflow.voice.member_join_event": {
+    inputSchema: interactiveWorkflowTriggerSchema.refine((trigger) => trigger.event === "voice.member_join_event", "voice member join trigger required"),
+    requiredPermissions: ["ManageGuild"], targetScope: "guild-voice-channel", risk: "voice-state-event",
+    approval: { required: false, binds: ["guildId", "voiceChannelId", "workflowId"] }, effects: ["voice-state.join-trigger.register"],
+  },
+  "workflow.voice.member_leave_event": {
+    inputSchema: interactiveWorkflowTriggerSchema.refine((trigger) => trigger.event === "voice.member_leave_event", "voice member leave trigger required"),
+    requiredPermissions: ["ManageGuild"], targetScope: "workflow-managed-voice-channel", risk: "voice-state-event",
+    approval: { required: false, binds: ["guildId", "workflowId", "managedVoiceSession"] }, effects: ["voice-state.leave-trigger.register"],
+  },
+  "workflow.voice.channel.create": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "voice.channel.create", "voice.channel.create action required"),
+    requiredPermissions: ["ManageGuild"], targetScope: "guild-and-approved-source-voice-channel", risk: "guild-resource-create-and-member-move",
+    approval: { required: false, binds: ["guildId", "workflowId", "sourceChannelId", "capacity"] }, effects: ["permissionless-temp-voice.create", "lobby-members.move"] ,
+  },
+  "workflow.voice.channel.delete": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "voice.channel.delete", "voice.channel.delete action required"),
+    requiredPermissions: ["ManageGuild"], targetScope: "workflow-owned-empty-voice-channel", risk: "guild-resource-delete",
+    approval: { required: false, binds: ["guildId", "workflowId", "managedVoiceSessionId", "emptyOnly"] }, effects: ["owned-empty-voice.delete"] ,
+  },
+  "workflow.resource.role.create": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "resource.role.create", "resource role creation action required"),
+    requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "manager-component-trigger-and-authenticated-guild", risk: "guild-resource-create",
+    approval: { required: false, binds: ["guildId", "workflowId", "stepId"] }, effects: ["permissionless-role.create-and-register-owned"],
+  },
+  "workflow.resource.channel.create_category": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "resource.channel.create_category", "category creation action required"),
+    requiredPermissions: ["ManageGuild", "ManageChannels"], targetScope: "manager-component-trigger-and-authenticated-guild", risk: "guild-resource-create",
+    approval: { required: false, binds: ["guildId", "workflowId", "stepId"] }, effects: ["default-permission-category.create-and-register-owned"],
+  },
+  "workflow.resource.channel.create_text": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "resource.channel.create_text", "text channel creation action required"),
+    requiredPermissions: ["ManageGuild", "ManageChannels"], targetScope: "manager-component-trigger-and-authenticated-guild", risk: "guild-resource-create",
+    approval: { required: false, binds: ["guildId", "workflowId", "stepId", "categoryStepId"] }, effects: ["default-permission-text-channel.create-and-register-owned"],
+  },
+  "workflow.giveaway.create": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.create", "Workflow giveaway.create action required"),
+    requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "admin-trigger-and-workflow-channel", risk: "guild-resource-create",
+    approval: { required: false, binds: ["guildId", "workflowId", "stepId", "channelId"] }, effects: ["giveaway.create-with-persistent-schedule"],
+  },
+  "workflow.giveaway.join": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.join", "Workflow giveaway.join action required"),
+    requiredPermissions: [], targetScope: "interaction-member-and-guild-giveaway", risk: "member-entry-write",
+    approval: { required: false, binds: ["guildId", "giveawayId", "memberId"] }, effects: ["unique-giveaway-entry.insert"],
+  },
+  "workflow.giveaway.leave": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.leave", "Workflow giveaway.leave action required"),
+    requiredPermissions: [], targetScope: "interaction-member-and-guild-giveaway", risk: "member-entry-write",
+    approval: { required: false, binds: ["guildId", "giveawayId", "memberId"] }, effects: ["giveaway-entry.delete"],
+  },
+  "workflow.giveaway.end": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.end", "Workflow giveaway.end action required"),
+    requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "admin-trigger-and-owned-giveaway", risk: "guild-state-write",
+    approval: { required: false, binds: ["guildId", "giveawayId", "actorId"] }, effects: ["giveaway.end-and-draw"],
+  },
+  "workflow.giveaway.pause": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.pause", "Workflow giveaway.pause action required"),
+    requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "admin-trigger-and-owned-giveaway", risk: "guild-state-write",
+    approval: { required: false, binds: ["guildId", "giveawayId", "actorId"] }, effects: ["giveaway.pause"],
+  },
+  "workflow.giveaway.resume": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.resume", "Workflow giveaway.resume action required"),
+    requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "admin-trigger-and-owned-giveaway", risk: "guild-state-write",
+    approval: { required: false, binds: ["guildId", "giveawayId", "actorId"] }, effects: ["giveaway.resume"],
+  },
+  "workflow.giveaway.reroll": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "giveaway.reroll", "Workflow giveaway.reroll action required"),
+    requiredPermissions: ["ManageGuild", "ManageRoles"], targetScope: "admin-trigger-and-owned-giveaway", risk: "guild-state-write",
+    approval: { required: false, binds: ["guildId", "giveawayId", "actorId"] }, effects: ["giveaway.reroll-and-audit"],
   },
   "role.create": {
     inputSchema: z.object({ id: z.string(), dependsOn: z.array(z.string()), action: z.literal("role.create"), name: z.string().min(1).max(100) }).strict(),
