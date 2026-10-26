@@ -116,6 +116,47 @@ try {
     );
     CREATE INDEX IF NOT EXISTS giveaway_notifications_due_idx ON giveaway_notifications(state, available_at);
     CREATE INDEX IF NOT EXISTS giveaway_notifications_guild_idx ON giveaway_notifications(guild_id);
+    CREATE TABLE IF NOT EXISTS interactive_workflows (
+      id text PRIMARY KEY, guild_id text NOT NULL, channel_id text NOT NULL, message_id text NOT NULL,
+      owner_id text NOT NULL, name text NOT NULL, version integer NOT NULL,
+      state text NOT NULL DEFAULT 'ACTIVE', spec jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS interactive_workflows_guild_message_idx ON interactive_workflows(guild_id, message_id);
+    CREATE INDEX IF NOT EXISTS interactive_workflows_guild_state_idx ON interactive_workflows(guild_id, state);
+    CREATE TABLE IF NOT EXISTS interactive_workflow_revisions (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, job_id text NOT NULL, actor_id text NOT NULL, version integer NOT NULL,
+      before_spec jsonb, after_spec jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS interactive_workflow_revisions_lookup_idx ON interactive_workflow_revisions(guild_id, workflow_id, version);
+    CREATE TABLE IF NOT EXISTS workflow_entries (
+      workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      collection text NOT NULL, user_id text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY(workflow_id, collection, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_entries_count_idx ON workflow_entries(workflow_id, collection);
+    CREATE TABLE IF NOT EXISTS workflow_states (
+      workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      scope text NOT NULL, scope_id text NOT NULL, key text NOT NULL, value jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(workflow_id, scope, scope_id, key)
+    );
+    CREATE TABLE IF NOT EXISTS workflow_runs (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, interaction_id text NOT NULL, trigger_id text NOT NULL, actor_id text NOT NULL,
+      state text NOT NULL, cursor integer NOT NULL DEFAULT 0, result jsonb, error_detail jsonb,
+      created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+      UNIQUE(guild_id, interaction_id)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_runs_workflow_state_idx ON workflow_runs(workflow_id, state);
+    CREATE TABLE IF NOT EXISTS workflow_schedules (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      guild_id text NOT NULL, trigger_id text NOT NULL, event text NOT NULL, interval_seconds integer,
+      next_at timestamptz NOT NULL, state text NOT NULL DEFAULT 'ACTIVE', lease_owner text,
+      lease_expires_at timestamptz, attempts integer NOT NULL DEFAULT 0, last_error text,
+      created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(workflow_id, trigger_id)
+    );
+    CREATE INDEX IF NOT EXISTS workflow_schedules_due_idx ON workflow_schedules(state, next_at);
     ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS remaining_seconds integer;
     CREATE TABLE IF NOT EXISTS runtime_leases (
       guild_id text PRIMARY KEY, job_id text NOT NULL, owner text NOT NULL, expires_at timestamptz NOT NULL

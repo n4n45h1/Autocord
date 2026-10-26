@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "VALORANT募集",
+  "title": "VALORANT 募集",
+  "description": "参加者 {{entries:participants:count}} / 5 人\n参加・取消はいつでも操作できます。",
+  "color": "red",
+  "components": [
+    {
+      "key": "join",
+      "kind": "button",
+      "label": "参加する",
+      "style": "success",
+      "emoji": "✅",
+      "disabledWhen": { "op": "entries.gte", "collection": "participants", "value": 5 },
+      "triggerId": "join-trigger"
+    },
+    {
+      "key": "leave",
+      "kind": "button",
+      "label": "参加取消",
+      "style": "secondary",
+      "emoji": "↩️",
+      "triggerId": "leave-trigger"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "join-trigger",
+      "event": "button",
+      "componentKey": "join",
+      "steps": [
+        { "id": "register", "action": "entry.join", "collection": "participants", "maxEntries": 5 },
+        { "id": "refresh", "action": "panel.refresh" }
+      ]
+    },
+    {
+      "id": "leave-trigger",
+      "event": "button",
+      "componentKey": "leave",
+      "steps": [
+        { "id": "cancel", "action": "entry.leave", "collection": "participants" },
+        { "id": "refresh", "action": "panel.refresh" }
+      ]
+    }
+  ]
+}

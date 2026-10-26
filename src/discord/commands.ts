@@ -3,9 +3,11 @@ import { SlashCommandBuilder } from "discord.js";
 export const commands = [
   new SlashCommandBuilder().setName("agent").setDescription("Agentcordに日本語でDiscord管理を依頼")
     .addStringOption((o) => o.setName("指示").setDescription("パネル・権限なしロール・Text Channel作成の依頼").setMaxLength(1500).setRequired(true))
-    .addStringOption((o) => o.setName("mode").setDescription("Mini=単一パネル、Max=複数Skill workflow").addChoices({ name: "Mini", value: "mini" }, { name: "Max", value: "max" })),
+    .addStringOption((o) => o.setName("mode").setDescription("Mini=単一パネル、Max=複数Skill workflow").addChoices({ name: "Mini", value: "mini" }, { name: "Max", value: "max" }))
+    .addStringOption((o) => o.setName("workflow_id").setDescription("編集するWorkflow（入力すると候補表示）").setAutocomplete(true)),
   new SlashCommandBuilder().setName("autocord").setDescription("Autocord管理")
     .addSubcommand((s) => s.setName("skills").setDescription("利用可能なAgentcord Skills一覧"))
+    .addSubcommand((s) => s.setName("workflows").setDescription("このサーバーのInteractive Workflow一覧"))
     .addSubcommand((s) => s.setName("panels").setDescription("このサーバーのパネル一覧"))
     .addSubcommand((s) => s.setName("roles").setDescription("Autocord管理ロールの一覧"))
     .addSubcommand((s) => s.setName("channels").setDescription("発行可能なチャンネル一覧"))

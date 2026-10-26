@@ -165,3 +165,76 @@ export const runtimeLeases = pgTable("runtime_leases", {
   owner: text("owner").notNull(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
 });
+
+export const interactiveWorkflows = pgTable("interactive_workflows", {
+  id: text("id").primaryKey(),
+  guildId: text("guild_id").notNull(),
+  channelId: text("channel_id").notNull(),
+  messageId: text("message_id").notNull(),
+  ownerId: text("owner_id").notNull(),
+  name: text("name").notNull(),
+  version: integer("version").notNull(),
+  state: text("state").default("ACTIVE").notNull(),
+  spec: jsonb("spec").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("interactive_workflows_guild_message_idx").on(table.guildId, table.messageId), index("interactive_workflows_guild_state_idx").on(table.guildId, table.state)]);
+
+export const interactiveWorkflowRevisions = pgTable("interactive_workflow_revisions", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  jobId: text("job_id").notNull(),
+  actorId: text("actor_id").notNull(),
+  version: integer("version").notNull(),
+  beforeSpec: jsonb("before_spec"),
+  afterSpec: jsonb("after_spec").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [index("interactive_workflow_revisions_lookup_idx").on(table.guildId, table.workflowId, table.version)]);
+
+export const workflowEntries = pgTable("workflow_entries", {
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  collection: text("collection").notNull(),
+  userId: text("user_id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [primaryKey({ columns: [table.workflowId, table.collection, table.userId] }), index("workflow_entries_count_idx").on(table.workflowId, table.collection)]);
+
+export const workflowStates = pgTable("workflow_states", {
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  scope: text("scope").notNull(),
+  scopeId: text("scope_id").notNull(),
+  key: text("key").notNull(),
+  value: jsonb("value").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [primaryKey({ columns: [table.workflowId, table.scope, table.scopeId, table.key] })]);
+
+export const workflowRuns = pgTable("workflow_runs", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  interactionId: text("interaction_id").notNull(),
+  triggerId: text("trigger_id").notNull(),
+  actorId: text("actor_id").notNull(),
+  state: text("state").notNull(),
+  cursor: integer("cursor").default(0).notNull(),
+  result: jsonb("result"),
+  errorDetail: jsonb("error_detail"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("workflow_runs_interaction_idx").on(table.guildId, table.interactionId), index("workflow_runs_workflow_state_idx").on(table.workflowId, table.state)]);
+
+export const workflowSchedules = pgTable("workflow_schedules", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  guildId: text("guild_id").notNull(),
+  triggerId: text("trigger_id").notNull(),
+  event: text("event").notNull(),
+  intervalSeconds: integer("interval_seconds"),
+  nextAt: timestamp("next_at", { withTimezone: true }).notNull(),
+  state: text("state").default("ACTIVE").notNull(),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  attempts: integer("attempts").default(0).notNull(),
+  lastError: text("last_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("workflow_schedules_workflow_trigger_idx").on(table.workflowId, table.triggerId), index("workflow_schedules_due_idx").on(table.state, table.nextAt)]);

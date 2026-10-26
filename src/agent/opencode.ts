@@ -36,8 +36,9 @@ async function jsonRequest<T>(baseUrl: string, path: string, init: RequestInit, 
 function parsePlanText(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
   const candidate = fenced ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  if (!candidate || candidate.startsWith("{") === false) throw new Error("OpenCodeモデルがJSON形式の操作計画を返しませんでした。");
-  return JSON.parse(candidate);
+  if (!candidate || candidate.startsWith("{") === false) throw Object.assign(new Error("OpenCode model response did not contain a JSON object."), { code: "INVALID_MODEL_JSON" });
+  try { return JSON.parse(candidate); }
+  catch { throw Object.assign(new Error("OpenCode model response contained invalid JSON."), { code: "INVALID_MODEL_JSON" }); }
 }
 
 export async function generateOpenCodePlan(prompt: string, model: string, timeoutMs: number): Promise<OpenCodePlanResult> {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { panelPlanSchema, type PanelPlan } from "./plan.js";
+import { interactiveWorkflowDraftSchema, type InteractiveWorkflow } from "./interactive-workflow.js";
 
 const stepBase = { id: z.string().regex(/^[a-z0-9_-]{1,40}$/), dependsOn: z.array(z.string().regex(/^[a-z0-9_-]{1,40}$/)).max(7) };
 
@@ -95,9 +96,12 @@ export type ResourceWorkflowStep = ResourceWorkflow["steps"][number];
 export const maxAgentWorkflowSchema = z.discriminatedUnion("target", [
   z.object({ target: z.literal("panel"), workflow: maxWorkflowSchema }).strict(),
   z.object({ target: z.literal("resources"), workflow: resourceWorkflowSchema }).strict(),
+  z.object({ target: z.literal("interactive"), workflow: interactiveWorkflowDraftSchema }).strict(),
+  z.object({ target: z.literal("clarification"), questions: z.array(z.string().min(1).max(300)).min(1).max(5), missingSkills: z.array(z.string().min(1).max(100)).max(8) }).strict(),
 ]);
 
 export type MaxAgentWorkflow = z.infer<typeof maxAgentWorkflowSchema>;
+export type InteractiveWorkflowPlan = InteractiveWorkflow;
 
 export function resourceSkillId(step: ResourceWorkflowStep): "role.create" | "channel.create_category" | "channel.create_text" {
   return step.action;

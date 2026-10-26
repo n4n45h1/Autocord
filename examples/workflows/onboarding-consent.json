@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "name": "同意確認とMemberロール",
+  "title": "サーバー参加の確認",
+  "description": "同意ボタンを押すと、Autocord管理の権限なしMemberロールが付与されます。",
+  "color": "green",
+  "components": [
+    {
+      "key": "consent",
+      "kind": "button",
+      "label": "同意して参加",
+      "style": "success",
+      "emoji": "🤝",
+      "triggerId": "consent-trigger"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "consent-trigger",
+      "event": "button",
+      "componentKey": "consent",
+      "steps": [
+        { "id": "record-consent", "action": "state.set", "scope": "member", "key": "onboarding_consent", "value": true },
+        { "id": "grant-member", "action": "role.grant", "roleName": "Member" },
+        { "id": "refresh", "action": "panel.refresh" }
+      ]
+    }
+  ]
+}

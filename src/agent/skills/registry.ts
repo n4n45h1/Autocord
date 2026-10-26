@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { panelPlanSchema, type PanelPlan } from "../plan.js";
 import { maxWorkflowSchema, resourceWorkflowSchema, resourceSkillId, type MaxWorkflow, type ResourceWorkflow, type ResourceWorkflowStep } from "../workflow.js";
+import { interactiveWorkflowSchema, interactiveWorkflowStepSchema } from "../interactive-workflow.js";
 
 const emptyInput = z.object({}).strict();
 const idInput = z.object({ id: z.string().min(1).max(80) }).strict();
@@ -53,6 +54,61 @@ export const agentSkills = {
     risk: "guild-resource-create",
     approval: { required: true, binds: ["guildId", "resourceWorkflowHash", "expiresAt"] },
     effects: ["role.create(permissionless)", "channel.create(category-or-text)"],
+  },
+  "workflow.publish": {
+    inputSchema: interactiveWorkflowSchema,
+    requiredPermissions: ["ManageGuild"], targetScope: "authenticated-guild-and-current-channel", risk: "guild-state-write",
+    approval: { required: true, binds: ["guildId", "channelId", "workflowHash", "expiresAt"] }, effects: ["workflow.v2-panel.publish"],
+  },
+  "workflow.update": {
+    inputSchema: interactiveWorkflowSchema,
+    requiredPermissions: ["ManageGuild"], targetScope: "authenticated-guild-and-workflow-version", risk: "guild-state-write",
+    approval: { required: true, binds: ["guildId", "workflowId", "expectedVersion", "workflowHash", "expiresAt"] }, effects: ["workflow.definition.update", "workflow.message.edit"],
+  },
+  "workflow.list": {
+    inputSchema: emptyInput,
+    requiredPermissions: ["ManageGuild"], targetScope: "authenticated-guild", risk: "read-only",
+    approval: { required: false, binds: [] }, effects: ["workflow-definition.read"],
+  },
+  "workflow.entry.join": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "entry.join", "workflow.entry.join requires entry.join"),
+    requiredPermissions: [], targetScope: "interaction-member-and-workflow-collection", risk: "member-entry-write",
+    approval: { required: false, binds: ["guildId", "workflowId", "memberId", "collection"] }, effects: ["unique-entry.register-with-cap"],
+  },
+  "workflow.entry.leave": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "entry.leave", "workflow.entry.leave requires entry.leave"),
+    requiredPermissions: [], targetScope: "interaction-member-and-workflow-collection", risk: "member-entry-write",
+    approval: { required: false, binds: ["guildId", "workflowId", "memberId", "collection"] }, effects: ["unique-entry.remove"],
+  },
+  "workflow.state.set": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "state.set", "workflow.state.set requires state.set"),
+    requiredPermissions: [], targetScope: "declared-workflow-state-key", risk: "workflow-state-write",
+    approval: { required: false, binds: ["workflowId", "stepId", "scope", "stateKey"] }, effects: ["workflow.state.upsert"],
+  },
+  "workflow.role.grant": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "role.grant", "workflow.role.grant requires role.grant"),
+    requiredPermissions: [], targetScope: "interaction-member-and-owned-permissionless-role", risk: "member-self-role-change",
+    approval: { required: false, binds: ["guildId", "workflowId", "memberId", "managedRoleId"] }, effects: ["managed-role.assign-to-member"],
+  },
+  "workflow.role.revoke": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "role.revoke", "workflow.role.revoke requires role.revoke"),
+    requiredPermissions: [], targetScope: "interaction-member-and-owned-permissionless-role", risk: "member-self-role-change",
+    approval: { required: false, binds: ["guildId", "workflowId", "memberId", "managedRoleId"] }, effects: ["managed-role.remove-from-member"],
+  },
+  "workflow.message.send": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "message.send", "workflow.message.send requires message.send"),
+    requiredPermissions: [], targetScope: "workflow-owned-channel", risk: "guild-message-write",
+    approval: { required: false, binds: ["workflowId", "channelId", "stepId"] }, effects: ["message.send-without-mentions"],
+  },
+  "workflow.message.edit": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "message.edit", "workflow.message.edit requires message.edit"),
+    requiredPermissions: [], targetScope: "workflow-owned-panel-message", risk: "guild-message-write",
+    approval: { required: false, binds: ["workflowId", "messageId", "stepId"] }, effects: ["workflow-panel-message.edit"],
+  },
+  "workflow.panel.refresh": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "panel.refresh", "workflow.panel.refresh requires panel.refresh"),
+    requiredPermissions: [], targetScope: "workflow-owned-panel-message", risk: "guild-message-write",
+    approval: { required: false, binds: ["workflowId", "messageId", "stepId"] }, effects: ["workflow-panel.render-state"],
   },
   "role.create": {
     inputSchema: z.object({ id: z.string(), dependsOn: z.array(z.string()), action: z.literal("role.create"), name: z.string().min(1).max(100) }).strict(),

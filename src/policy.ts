@@ -3,6 +3,7 @@ import type { PanelPlan } from "./agent/plan.js";
 import { agentSkills, resolvePanelSkill, type AgentSkillId } from "./agent/skills/registry.js";
 import { resolveResourceSkill } from "./agent/skills/registry.js";
 import type { ResourceWorkflow } from "./agent/workflow.js";
+import type { InteractiveWorkflow, InteractiveWorkflowStep } from "./agent/interactive-workflow.js";
 
 const skillPermissionFlags = {
   ManageGuild: PermissionFlagsBits.ManageGuild,
@@ -28,6 +29,39 @@ export function assertResourceWorkflowPermissions(guild: Guild, workflow: Resour
     if (step.action === "role.create" && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Botにロール管理権限がありません。");
     if ((step.action === "channel.create_category" || step.action === "channel.create_text") && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Botにチャンネル管理権限がありません。");
   }
+}
+
+const interactiveActionSkills: Record<InteractiveWorkflowStep["action"], AgentSkillId> = {
+  "entry.join": "workflow.entry.join",
+  "entry.leave": "workflow.entry.leave",
+  "state.set": "workflow.state.set",
+  "role.grant": "workflow.role.grant",
+  "role.revoke": "workflow.role.revoke",
+  "message.send": "workflow.message.send",
+  "message.edit": "workflow.message.edit",
+  "panel.refresh": "workflow.panel.refresh",
+};
+
+export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: InteractiveWorkflow, actor: GuildMember): void {
+  if (!agentSkills["workflow.publish"].approval.required) throw new Error("Interactive Workflow publication requires approval.");
+  assertSkillPermissions("workflow.publish", actor);
+  const bot = guild.members.me;
+  if (!bot) throw new Error("Bot guild member could not be resolved.");
+  for (const trigger of workflow.triggers) for (const step of trigger.steps) {
+    const skillId = interactiveActionSkills[step.action];
+    assertSkillPermissions(skillId, actor);
+    if (step.action === "role.grant" || step.action === "role.revoke") {
+      if (!bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for this Workflow.");
+    }
+    if (step.action === "message.send" || step.action === "message.edit" || step.action === "panel.refresh") {
+      if (!bot.permissions.has(PermissionFlagsBits.SendMessages)) throw new Error("Bot needs Send Messages for this Workflow.");
+    }
+  }
+}
+
+export function assertInteractiveWorkflowUpdatePermission(actor: GuildMember): void {
+  if (!agentSkills["workflow.update"].approval.required) throw new Error("Interactive Workflow updates require an approval gate.");
+  assertSkillPermissions("workflow.update", actor);
 }
 
 export function assertPolicy(guild: Guild, actor: GuildMember, plan: PanelPlan): void {
@@ -65,6 +99,14 @@ export function assertDistributableRole(guild: Guild, role: Role, ownerJobId: st
   const bot = guild.members.me;
   if (!bot || !isBelowHierarchy(role.position, bot.roles.highest.position)) throw new Error(`Botのロール階層外です: ${role.name}`);
   if (actor.id !== guild.ownerId && !isBelowHierarchy(role.position, actor.roles.highest.position)) throw new Error(`実行者のロール階層外です: ${role.name}`);
+}
+
+export function assertSelfAssignableRole(guild: Guild, role: Role, ownerJobId: string | undefined): void {
+  if (role.id === guild.id || role.managed) throw new Error("@everyoneと連携アプリ管理ロールはWorkflowで配布できません。");
+  if (!ownerJobId) throw new Error(`Autocordが所有していない既存ロールはWorkflowで配布できません: ${role.name}`);
+  if (role.permissions.bitfield !== 0n || containsForbiddenPermissions(role.permissions.bitfield)) throw new Error(`権限付きロールはWorkflowで配布できません: ${role.name}`);
+  const bot = guild.members.me;
+  if (!bot?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= bot.roles.highest.position) throw new Error(`Botが操作できない階層のロールです: ${role.name}`);
 }
 
 export function containsForbiddenPermissions(bitfield: bigint): boolean {
