@@ -113,11 +113,11 @@ describe("generic interactive Workflow definitions", () => {
       ],
       triggers: [
         { id: "join-trigger", event: "button", componentKey: "join", steps: [
-          { id: "join", action: "entry.join", collection: "participants", maxEntries: 100 },
-          { id: "award", action: "state.increment", scope: "member", key: "points", amount: 100, dependsOn: ["join"], when: { op: "result.equals", stepId: "join", field: "joined", value: true } },
+          { id: "join", action: "collection.add", scope: "workflow", collection: "participants", item: "{{actor}}", maxItems: 10000 },
+          { id: "award", action: "state.increment", scope: "member", key: "points", amount: 100, dependsOn: ["join"], when: { op: "result.equals", stepId: "join", field: "added", value: true } },
         ] },
         { id: "redeem-trigger", event: "button", componentKey: "redeem", steps: [
-          { id: "debit", action: "state.debit", scope: "member", key: "points", amount: 500, minimumBalance: 500 },
+          { id: "debit", action: "state.debit", scope: "member", key: "points", amount: 500, minimumBalance: 500, idempotencyKey: "game-key" },
           { id: "reward", action: "message.dm", recipient: "trigger_member", content: "景品交換が完了しました。", dependsOn: ["debit"], when: { op: "result.equals", stepId: "debit", field: "debited", value: true } },
         ] },
       ],

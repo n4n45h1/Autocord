@@ -90,12 +90,12 @@ function hasMemberRoleGuard(condition: WorkflowCondition | undefined, roleName: 
   return condition.op === "member.has_role" && condition.roleName === roleName;
 }
 
-async function assertWorkflowManagedRoles(guildId: string, guild: import("discord.js").Guild, workflow: InteractiveWorkflow): Promise<void> {
+async function assertWorkflowManagedRoles(guildId: string, guild: import("discord.js").Guild, workflow: InteractiveWorkflow, workflowId?: string): Promise<void> {
   const roleNames = new Set(workflow.triggers.flatMap((trigger) => trigger.steps)
     .filter((step) => step.action === "role.grant" || step.action === "role.revoke").map((step) => step.roleName));
   const owned = await db.select({ roleId: managedRoles.roleId, ownerJobId: managedRoles.ownerJobId }).from(managedRoles).where(eq(managedRoles.guildId, guildId));
   for (const step of workflow.triggers.flatMap((trigger) => trigger.steps).filter((item) => item.action === "resource.role.create")) {
-    if (guild.roles.cache.some((role) => role.name === step.name)) throw new Error(`Workflow role.create cannot shadow an existing role name: ${step.name}`);
+    if (guild.roles.cache.some((role) => role.name === step.name && !owned.some((binding) => binding.roleId === role.id && workflowId !== undefined && binding.ownerJobId === workflowId))) throw new Error(`Workflow role.create cannot shadow an existing role name: ${step.name}`);
   }
   for (const roleName of roleNames) {
     const matches = [];
@@ -242,7 +242,8 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
       return false;
     }
     const availableVoiceChannels = requestRequirements.voiceRequested && namedVoiceChannels.length === 1 ? namedVoiceChannels : allVoiceChannels;
-    const result = await makePlan(instruction, existing, mode, selectedWorkflow ? { id: selectedWorkflow.id, version: selectedWorkflow.version, spec: existingWorkflowSpec! } : undefined, availableManagedRoles, availableVoiceChannels);
+    const availableStaffRoles = [...interaction.guild!.roles.cache.values()].filter((role) => role.id !== interaction.guildId && !role.managed).map((role) => ({ id: role.id, name: role.name }));
+    const result = await makePlan(instruction, existing, mode, selectedWorkflow ? { id: selectedWorkflow.id, version: selectedWorkflow.version, spec: existingWorkflowSpec! } : undefined, availableManagedRoles, availableVoiceChannels, availableStaffRoles);
     const actor = await interaction.guild!.members.fetch(interaction.user.id);
 
     if (result.clarification) {
@@ -292,7 +293,7 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
       assertInteractiveWorkflowPermissions(interaction.guild!, workflow, actor);
       await assertWorkflowVoiceBindings(interaction.guild!, workflow);
       if (selectedWorkflow) assertInteractiveWorkflowUpdatePermission(actor);
-      await assertWorkflowManagedRoles(interaction.guildId!, interaction.guild!, workflow);
+      await assertWorkflowManagedRoles(interaction.guildId!, interaction.guild!, workflow, selectedWorkflow?.id);
       if (Boolean(selectedWorkflow) !== Boolean(result.interactiveWorkflowId) || selectedWorkflow && result.expectedWorkflowVersion !== selectedWorkflow.version) throw new Error("更新対象Workflow/versionが一致しません。");
       const workflowIntent = selectedWorkflow ? "edit" : "create";
       const executionContext = { interactiveWorkflow: workflow, publishChannelId: workflowChannelId, workflowIntent, workflowId: selectedWorkflow?.id ?? null, expectedWorkflowVersion: selectedWorkflow?.version ?? null };
@@ -491,8 +492,9 @@ async function executeApproved(jobId: string, guildId: string, actor: GuildMembe
     const [job] = await db.select().from(agentJobs).where(and(eq(agentJobs.id, jobId), eq(agentJobs.guildId, guildId))).limit(1);
     if (!job || !job.planHash || job.planHashVersion !== 2 || job.state !== "EXECUTING") throw new Error("実行対象ジョブが見つからないか、再プレビューが必要です。");
     const context = job.executionContext as { resourceWorkflow?: unknown; interactiveWorkflow?: unknown; workflowIntent?: string; workflowId?: string | null; expectedWorkflowVersion?: number | null; publishChannelId?: string; workflowSteps?: unknown; restoreBindings?: unknown } | null;
+    // Verify the approved payload before schema defaults normalize older plans.
+    if (approvalHash({ guildId, revision: job.revision, plan: job.plan, executionContext: job.executionContext }) !== job.planHash) throw new Error("承認後にプランが変更されています。");
     const plan = job.plan ? panelPlanSchema.parse(job.plan) : null;
-    if (approvalHash({ guildId, revision: job.revision, plan, executionContext: job.executionContext }) !== job.planHash) throw new Error("承認後にプランが変更されています。");
     const guild = client.guilds.cache.get(guildId);
     if (!guild) throw new Error("サーバーを取得できません。");
     const freshActor = await guild.members.fetch(actor.id);
@@ -506,7 +508,7 @@ async function executeApproved(jobId: string, guildId: string, actor: GuildMembe
       if (!context.publishChannelId) throw new Error("Workflowの公開先がありません。");
       assertInteractiveWorkflowPermissions(guild, workflow, freshActor);
       await assertWorkflowVoiceBindings(guild, workflow);
-      await assertWorkflowManagedRoles(guildId, guild, workflow);
+      await assertWorkflowManagedRoles(guildId, guild, workflow, context.workflowIntent === "edit" ? context.workflowId ?? undefined : undefined);
       if (context.workflowIntent === "edit") {
         if (!context.workflowId || context.expectedWorkflowVersion == null) throw new Error("Workflow update target/version is missing.");
         assertInteractiveWorkflowUpdatePermission(freshActor);

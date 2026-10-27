@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 const key = z.string().regex(/^[a-z0-9._-]{1,40}$/);
+const templateToken = /^(?:actor|entries:[a-z0-9._-]{1,40}:count|state:(?:workflow|guild|member):[a-z0-9._-]{1,40}|result:[a-z0-9._-]{1,40}:[A-Za-z0-9._-]{1,40}|input:[A-Za-z0-9._-]{1,40}|selected:\d{1,2})$/;
 const scalar = z.union([z.string().max(1000), z.number(), z.boolean(), z.null()]);
 const finiteNumber = z.number().finite().min(-1_000_000_000_000).max(1_000_000_000_000);
 const numericOperand = z.union([finiteNumber, z.string().max(100)]);
@@ -19,7 +20,7 @@ const conditionLeaf = z.discriminatedUnion("op", [
   z.object({ op: z.literal("member.has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "MoveMembers", "Administrator"]) }).strict(),
   z.object({ op: z.literal("time.within"), startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict().refine((condition) => Date.parse(condition.endAt) > Date.parse(condition.startAt), "time.within endAt must follow startAt"),
   z.object({ op: z.literal("random.chance"), percent: z.number().min(0).max(100) }).strict(),
-  z.object({ op: z.literal("result.equals"), stepId: key, field: key, value: scalar }).strict(),
+  z.object({ op: z.literal("result.equals"), stepId: key, field: z.string().regex(/^[A-Za-z0-9._-]{1,40}$/), value: scalar }).strict(),
   z.object({ op: z.literal("voice.members.gte"), value: z.number().int().min(1).max(99) }).strict(),
   z.object({ op: z.literal("voice.members.eq"), value: z.number().int().min(0).max(99) }).strict(),
   z.object({ op: z.literal("voice.session.exists") }).strict(),
@@ -74,7 +75,7 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("state.increment"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand }).strict(),
   z.object({ ...stepBase, action: z.literal("state.decrement"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand }).strict(),
   z.object({ ...stepBase, action: z.literal("state.multiply"), scope: z.enum(["workflow", "guild", "member"]), key, factor: numericOperand }).strict(),
-  z.object({ ...stepBase, action: z.literal("state.debit"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand, minimumBalance: numericOperand }).strict(),
+  z.object({ ...stepBase, action: z.literal("state.debit"), scope: z.enum(["workflow", "guild", "member"]), key, amount: numericOperand, minimumBalance: numericOperand, idempotencyKey: key.nullable().default(null) }).strict(),
   z.object({ ...stepBase, action: z.literal("state.delete"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ ...stepBase, action: z.literal("state.reset"), scope: z.enum(["workflow", "guild", "member"]), key: key.nullable(), value: scalar.default(null) }).strict(),
   z.object({ ...stepBase, action: z.literal("state.append"), scope: z.enum(["workflow", "guild", "member"]), key, value: scalar }).strict(),
@@ -206,7 +207,9 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
     }
     for (const step of trigger.steps) {
       const text = Object.values(step).filter((value): value is string => typeof value === "string").join("\n");
-      for (const match of text.matchAll(/\{\{result:([a-z0-9._-]{1,40}):[a-z0-9._-]{1,40}\}\}/g)) requireResultDependency(step.id, match[1]!, `Step ${step.id}`);
+      for (const match of text.matchAll(/\{\{([^{}]*)\}\}/g)) if (!templateToken.test(match[1]!)) ctx.addIssue({ code: "custom", message: `Step ${step.id} contains an unsupported template token: {{${match[1]}}}` });
+      if (text.includes("{{") && !/\{\{[^{}]*\}\}/.test(text)) ctx.addIssue({ code: "custom", message: `Step ${step.id} contains a malformed template token.` });
+      for (const match of text.matchAll(/\{\{result:([a-z0-9._-]{1,40}):[A-Za-z0-9._-]{1,40}\}\}/g)) requireResultDependency(step.id, match[1]!, `Step ${step.id}`);
       if ((step.action === "message.delete" || step.action === "message.pin" || step.action === "message.unpin" || step.action === "message.edit" && step.targetStepId) && "targetStepId" in step && step.targetStepId) {
         const target = stepById.get(step.targetStepId);
         requireResultDependency(step.id, step.targetStepId, `Step ${step.id}`);
@@ -326,6 +329,7 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       else for (const entryStep of entrySteps) if (!dependsOnAncestor(refresh.id, entryStep.id)) ctx.addIssue({ code: "custom", message: `Panel refresh in ${trigger.id} must depend on entry step ${entryStep.id}.` });
     }
   }
+  for (const match of workflow.description.matchAll(/\{\{([^{}]*)\}\}/g)) if (!templateToken.test(match[1]!)) ctx.addIssue({ code: "custom", message: `Workflow description contains an unsupported template token: {{${match[1]}}}` });
   if (totalSteps > 24) ctx.addIssue({ code: "custom", message: "Interactive workflow has more than 24 total action steps." });
   for (const component of workflow.components) if (!triggerIds.has(component.triggerId)) ctx.addIssue({ code: "custom", message: `UI component ${component.key} has no trigger.` });
 });

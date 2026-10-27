@@ -156,6 +156,11 @@ try {
       UNIQUE(workflow_id, scope, scope_id, collection, item_key)
     );
     CREATE INDEX IF NOT EXISTS workflow_collections_count_idx ON workflow_collections(workflow_id, scope, scope_id, collection, created_at);
+    CREATE TABLE IF NOT EXISTS workflow_debit_claims (
+      id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
+      scope text NOT NULL, scope_id text NOT NULL, redemption_key text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(), UNIQUE(workflow_id, scope, scope_id, redemption_key)
+    );
     CREATE TABLE IF NOT EXISTS workflow_messages (
       id text PRIMARY KEY, workflow_id text NOT NULL REFERENCES interactive_workflows(id) ON DELETE CASCADE,
       guild_id text NOT NULL, run_id text NOT NULL, step_id text NOT NULL,

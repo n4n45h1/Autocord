@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "eval:max": "tsx src/agent/max-eval.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "commands:deploy": "tsx src/deploy-commands.ts"
   },

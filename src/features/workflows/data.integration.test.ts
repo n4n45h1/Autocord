@@ -59,5 +59,9 @@ postgresTests("Workflow state and collection PostgreSQL primitives", () => {
     const redemptions = await Promise.all(Array.from({ length: 6 }, () => debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "redeemer", key: "points", amount: 500, minimumBalance: 500 })));
     expect(redemptions.filter((result) => result.debited)).toHaveLength(2);
     expect(redemptions.at(-1)?.value).toBe(0);
+    await mutateWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "idempotent-redeemer", key: "points", operation: "increment", amount: 2000 });
+    const duplicateClicks = await Promise.all(Array.from({ length: 8 }, () => debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "idempotent-redeemer", key: "points", amount: 500, minimumBalance: 500, idempotencyKey: "game-key" })));
+    expect(duplicateClicks.filter((result) => result.debited)).toHaveLength(1);
+    expect(duplicateClicks.filter((result) => result.duplicate)).toHaveLength(7);
   });
 });

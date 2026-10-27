@@ -525,8 +525,14 @@ async function executeWorkflowStep(workflow: WorkflowRecord, runId: string, step
       return { left: removed.length > 0 };
     }
     case "state.set": {
-      assertWritableStateKey(step.scope, step.key);
       const value = resolvedScalar(step.value, templateContext);
+      if (step.scope === "workflow" && step.key === "active_giveaway_id") {
+        // Older workflows explicitly save the ID already bound by giveaway.create.
+        if (typeof value !== "string" || !value) throw new Error("Workflow Giveaway reference did not resolve to an ID.");
+        await loadWorkflowGiveaway(workflow, value);
+        return { key: step.key, scope: step.scope };
+      }
+      assertWritableStateKey(step.scope, step.key);
       const scopeId = scopedStateId(step.scope, workflow, member);
       await db.insert(workflowStates).values({ workflowId: workflow.id, scope: step.scope, scopeId, key: step.key, value, updatedAt: new Date() }).onConflictDoUpdate({ target: [workflowStates.workflowId, workflowStates.scope, workflowStates.scopeId, workflowStates.key], set: { value, updatedAt: new Date() } });
       return { key: step.key, scope: step.scope };
@@ -551,6 +557,7 @@ async function executeWorkflowStep(workflow: WorkflowRecord, runId: string, step
       return debitWorkflowNumber({
         workflowId: workflow.id, scope: step.scope, scopeId, key: step.key,
         amount: resolvedNumber(step.amount, templateContext), minimumBalance: resolvedNumber(step.minimumBalance, templateContext),
+        idempotencyKey: step.idempotencyKey,
       });
     }
     case "state.delete":

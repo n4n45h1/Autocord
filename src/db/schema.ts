@@ -223,6 +223,15 @@ export const workflowCollections = pgTable("workflow_collections", {
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => [uniqueIndex("workflow_collections_item_idx").on(table.workflowId, table.scope, table.scopeId, table.collection, table.itemKey), index("workflow_collections_count_idx").on(table.workflowId, table.scope, table.scopeId, table.collection, table.createdAt)]);
 
+export const workflowDebitClaims = pgTable("workflow_debit_claims", {
+  id: text("id").primaryKey(),
+  workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),
+  scope: text("scope").notNull(),
+  scopeId: text("scope_id").notNull(),
+  redemptionKey: text("redemption_key").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [uniqueIndex("workflow_debit_claim_once_idx").on(table.workflowId, table.scope, table.scopeId, table.redemptionKey)]);
+
 export const workflowMessages = pgTable("workflow_messages", {
   id: text("id").primaryKey(),
   workflowId: text("workflow_id").notNull().references(() => interactiveWorkflows.id, { onDelete: "cascade" }),

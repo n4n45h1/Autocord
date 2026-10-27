@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../db/client.js";
-import { workflowCollections, workflowStates } from "../../db/schema.js";
+import { workflowCollections, workflowDebitClaims, workflowStates } from "../../db/schema.js";
 
 export async function mutateWorkflowNumber(input: {
   workflowId: string;
@@ -35,22 +35,35 @@ export async function debitWorkflowNumber(input: {
   key: string;
   amount: number;
   minimumBalance: number;
-}): Promise<{ debited: boolean; value: number }> {
+  idempotencyKey?: string | null;
+}): Promise<{ debited: boolean; duplicate: boolean; value: number }> {
   if (!Number.isFinite(input.amount) || input.amount <= 0 || !Number.isFinite(input.minimumBalance) || input.minimumBalance < input.amount) throw new Error("Debit amount and minimum balance must be finite and positive, with minimumBalance >= amount.");
-  const lockKey = `${input.workflowId}:${input.scope}:${input.scopeId}:${input.key}`;
+  const lockKey = `${input.workflowId}:${input.scope}:${input.scopeId}:${input.key}:${input.idempotencyKey ?? ""}`;
   return db.transaction(async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
+    if (input.idempotencyKey) {
+      const [priorClaim] = await tx.select({ id: workflowDebitClaims.id }).from(workflowDebitClaims).where(and(
+        eq(workflowDebitClaims.workflowId, input.workflowId), eq(workflowDebitClaims.scope, input.scope), eq(workflowDebitClaims.scopeId, input.scopeId), eq(workflowDebitClaims.redemptionKey, input.idempotencyKey),
+      )).limit(1);
+      if (priorClaim) {
+        const [priorState] = await tx.select({ value: workflowStates.value }).from(workflowStates).where(and(
+          eq(workflowStates.workflowId, input.workflowId), eq(workflowStates.scope, input.scope), eq(workflowStates.scopeId, input.scopeId), eq(workflowStates.key, input.key),
+        )).limit(1);
+        return { debited: false, duplicate: true, value: typeof priorState?.value === "number" ? priorState.value : 0 };
+      }
+    }
     const [row] = await tx.select({ value: workflowStates.value }).from(workflowStates).where(and(
       eq(workflowStates.workflowId, input.workflowId), eq(workflowStates.scope, input.scope), eq(workflowStates.scopeId, input.scopeId), eq(workflowStates.key, input.key),
     )).limit(1);
     const current = row?.value ?? 0;
     if (typeof current !== "number" || !Number.isFinite(current)) throw new Error(`State ${input.key} is not a finite number.`);
-    if (current < input.minimumBalance) return { debited: false, value: current };
+    if (current < input.minimumBalance) return { debited: false, duplicate: false, value: current };
     const value = current - input.amount;
     await tx.insert(workflowStates).values({ workflowId: input.workflowId, scope: input.scope, scopeId: input.scopeId, key: input.key, value, updatedAt: new Date() }).onConflictDoUpdate({
       target: [workflowStates.workflowId, workflowStates.scope, workflowStates.scopeId, workflowStates.key], set: { value, updatedAt: new Date() },
     });
-    return { debited: true, value };
+    if (input.idempotencyKey) await tx.insert(workflowDebitClaims).values({ id: randomUUID(), workflowId: input.workflowId, scope: input.scope, scopeId: input.scopeId, redemptionKey: input.idempotencyKey });
+    return { debited: true, duplicate: false, value };
   });
 }
 
