@@ -179,7 +179,9 @@ describe("Panel edit regressions through Discord interactions", () => {
     };
     await dispatch(input as unknown as Interaction);
     expect(mocks.writes).toContainEqual(expect.objectContaining({ table: agentJobs, value: expect.objectContaining({ state: "AWAITING_APPROVAL" }) }));
-    expect(input.followUp).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("v1 → Roles v2") }));
+    const previewCalls = input.followUp.mock.calls as unknown as unknown[][];
+    const previewReply = previewCalls[0]?.[0] as { embeds?: { toJSON: () => { description?: string } }[] };
+    expect(previewReply.embeds?.map((embed) => embed.toJSON().description ?? "").join("\n")).toContain("v1 → Roles v2");
   });
 
   it.each([false, true])("verifies the stored panel payload before adding defaults (tampered=%s)", async (tampered) => {
