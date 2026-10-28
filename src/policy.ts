@@ -9,12 +9,13 @@ const skillPermissionFlags = {
   ManageGuild: PermissionFlagsBits.ManageGuild,
   ManageRoles: PermissionFlagsBits.ManageRoles,
   ManageChannels: PermissionFlagsBits.ManageChannels,
+  MoveMembers: PermissionFlagsBits.MoveMembers,
 } as const;
 
 export function assertSkillPermissions(skillId: AgentSkillId, actor: GuildMember): void {
   const skill = agentSkills[skillId];
   const missing = skill.requiredPermissions.filter((permission) => !actor.permissions.has(skillPermissionFlags[permission]));
-  const labels = { ManageGuild: "サーバー管理", ManageRoles: "ロール管理", ManageChannels: "チャンネル管理" } as const;
+  const labels = { ManageGuild: "サーバー管理", ManageRoles: "ロール管理", ManageChannels: "チャンネル管理", MoveMembers: "メンバー移動" } as const;
   if (missing.length) throw new Error(`必要なDiscord権限がありません: ${missing.map((permission) => labels[permission]).join("、")}`);
 }
 
@@ -83,6 +84,8 @@ const interactiveActionSkills: Record<InteractiveWorkflowStep["action"], AgentSk
   "channel.delete": "workflow.channel.delete",
   "channel.set_permission": "workflow.channel.set_permission",
   "channel.move_member": "workflow.channel.move_member",
+  "channel.move_members": "workflow.channel.move_members",
+  "channel.delete_empty": "workflow.channel.delete_empty",
   "channel.get_members": "workflow.channel.get_members",
   "role.rename": "workflow.role.rename",
   "role.member_count": "workflow.role.member_count",
@@ -118,11 +121,14 @@ export function assertInteractiveWorkflowPermissions(guild: Guild, workflow: Int
         if (!bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for Voice Workflow actions.");
         if (step.action === "voice.channel.create" && !bot.permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error("Bot needs Move Members to gather the lobby occupants in a temporary voice channel.");
       }
+      if (step.action === "channel.create_voice" && !actor.permissions.has([PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageChannels])) throw new Error("Creating a Workflow-owned Voice Channel requires Manage Server and Manage Channels at approval time.");
+      if (step.action === "channel.move_members" && !bot.permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error("Bot needs Move Members for batch Workflow movement.");
       if (step.action === "resource.role.create" && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for Workflow role creation.");
       if ((step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text") && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for Workflow channel creation.");
-      if (["channel.create_voice", "channel.rename", "channel.delete", "channel.set_permission"].includes(step.action) && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for this Workflow action.");
+      if (["channel.create_voice", "channel.rename", "channel.delete", "channel.delete_empty", "channel.set_permission"].includes(step.action) && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for this Workflow action.");
       if (step.action === "channel.create_text" && !bot.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error("Bot needs Manage Channels for channel.create_text.");
       if (step.action === "channel.move_member" && !bot.permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error("Bot needs Move Members for this Workflow action.");
+      if (step.action === "channel.move_members" && !bot.permissions.has(PermissionFlagsBits.MoveMembers)) throw new Error("Bot needs Move Members for this Workflow action.");
       if (step.action === "role.rename" && !bot.permissions.has(PermissionFlagsBits.ManageRoles)) throw new Error("Bot needs Manage Roles for this Workflow action.");
       if (step.action === "role.member_count" && process.env.ENABLE_GUILD_MEMBERS_INTENT !== "true") throw new Error("role.member_count requires the privileged Guild Members intent.");
     }

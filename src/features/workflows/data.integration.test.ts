@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { addWorkflowCollectionItem, debitWorkflowNumber, mutateWorkflowNumber } from "./data.js";
+import { addWorkflowCollectionItem, debitWorkflowNumber, joinWorkflowEntry, leaveWorkflowEntry, mutateWorkflowNumber } from "./data.js";
 
 const postgresTests = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -10,6 +10,7 @@ postgresTests("Workflow state and collection PostgreSQL primitives", () => {
   let pool: typeof import("../../db/client.js").pool;
   let interactiveWorkflows: typeof import("../../db/schema.js").interactiveWorkflows;
   let workflowCollections: typeof import("../../db/schema.js").workflowCollections;
+  let workflowEntries: typeof import("../../db/schema.js").workflowEntries;
   let workflowStates: typeof import("../../db/schema.js").workflowStates;
   const workflowA = randomUUID();
   const workflowB = randomUUID();
@@ -22,6 +23,7 @@ postgresTests("Workflow state and collection PostgreSQL primitives", () => {
     pool = client.pool;
     interactiveWorkflows = schema.interactiveWorkflows;
     workflowCollections = schema.workflowCollections;
+    workflowEntries = schema.workflowEntries;
     workflowStates = schema.workflowStates;
     for (const [id, guildId] of [[workflowA, `guild-a-${workflowA}`], [workflowB, `guild-b-${workflowB}`]] as const) {
       await db.insert(interactiveWorkflows).values({ id, guildId, channelId: "channel", messageId: `message-${id}`, ownerId: "owner", name: "test", version: 1, state: "ACTIVE", spec: {} });
@@ -54,6 +56,26 @@ postgresTests("Workflow state and collection PostgreSQL primitives", () => {
     expect(rows).toHaveLength(3);
   });
 
+  it("keeps a capped member-entry collection within capacity under concurrent joins and leave/rejoin races", async () => {
+    const joins = await Promise.all(Array.from({ length: 10 }, (_, index) => joinWorkflowEntry({ workflowId: workflowA, collection: "party", userId: `member-${index}`, maxEntries: 5 })));
+    expect(joins.filter((result) => result.joined)).toHaveLength(5);
+    expect(Math.max(...joins.map((result) => result.count))).toBe(5);
+    expect(joins.every((result) => result.count <= 5)).toBe(true);
+    const acceptedActorIndex = joins.findIndex((result) => result.joined);
+    const acceptedActor = `member-${acceptedActorIndex}`;
+    const duplicate = await joinWorkflowEntry({ workflowId: workflowA, collection: "party", userId: acceptedActor, maxEntries: 5 });
+    expect(duplicate).toMatchObject({ joined: false, duplicate: true, count: 5, full: true });
+
+    const raced = await Promise.all([
+      leaveWorkflowEntry({ workflowId: workflowA, collection: "party", userId: acceptedActor }),
+      joinWorkflowEntry({ workflowId: workflowA, collection: "party", userId: "member-new", maxEntries: 5 }),
+    ]);
+    expect(raced.every((result) => result.count <= 5)).toBe(true);
+    const [count] = await db.select({ count: sql<number>`count(*)::int` }).from(workflowEntries)
+      .where(and(eq(workflowEntries.workflowId, workflowA), eq(workflowEntries.collection, "party")));
+    expect(count?.count).toBeLessThanOrEqual(5);
+  });
+
   it("atomically prevents concurrent point redemptions below the required balance", async () => {
     await mutateWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "redeemer", key: "points", operation: "increment", amount: 1000 });
     const redemptions = await Promise.all(Array.from({ length: 6 }, () => debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "redeemer", key: "points", amount: 500, minimumBalance: 500 })));
@@ -63,5 +85,17 @@ postgresTests("Workflow state and collection PostgreSQL primitives", () => {
     const duplicateClicks = await Promise.all(Array.from({ length: 8 }, () => debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "idempotent-redeemer", key: "points", amount: 500, minimumBalance: 500, idempotencyKey: "game-key" })));
     expect(duplicateClicks.filter((result) => result.debited)).toHaveLength(1);
     expect(duplicateClicks.filter((result) => result.duplicate)).toHaveLength(7);
+  });
+
+  it("preserves user-selected 50/300 point values and makes that redemption idempotent", async () => {
+    await mutateWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "fifty-thirty", key: "points", operation: "increment", amount: 50 });
+    const denied = await debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "fifty-thirty", key: "points", amount: 300, minimumBalance: 300, idempotencyKey: "exchange-300" });
+    expect(denied).toMatchObject({ debited: false, value: 50 });
+    await mutateWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "fifty-thirty", key: "points", operation: "increment", amount: 250 });
+    const concurrent = await Promise.all(Array.from({ length: 6 }, () => debitWorkflowNumber({ workflowId: workflowA, scope: "member", scopeId: "fifty-thirty", key: "points", amount: 300, minimumBalance: 300, idempotencyKey: "exchange-300" })));
+    expect(concurrent.filter((result) => result.debited)).toHaveLength(1);
+    expect(concurrent.filter((result) => result.duplicate)).toHaveLength(5);
+    const [balance] = await db.select({ value: workflowStates.value }).from(workflowStates).where(and(eq(workflowStates.workflowId, workflowA), eq(workflowStates.scopeId, "fifty-thirty"), eq(workflowStates.key, "points")));
+    expect(balance?.value).toBe(0);
   });
 });

@@ -210,6 +210,16 @@ export const agentSkills = {
   "workflow.channel.delete": workflowActionSkill("channel.delete"),
   "workflow.channel.set_permission": workflowActionSkill("channel.set_permission"),
   "workflow.channel.move_member": workflowActionSkill("channel.move_member"),
+  "workflow.channel.move_members": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "channel.move_members", "channel.move_members action required"),
+    requiredPermissions: ["ManageGuild", "MoveMembers"], targetScope: "workflow-owned-voice-channel-and-registered-members", risk: "bounded-guild-member-move",
+    approval: { required: false, binds: ["guildId", "workflowId", "collection", "channelStepId", "maxMembers"] }, effects: ["registered-members.move-to-owned-voice-channel"],
+  },
+  "workflow.channel.delete_empty": {
+    inputSchema: interactiveWorkflowStepSchema.refine((step) => step.action === "channel.delete_empty", "channel.delete_empty action required"),
+    requiredPermissions: ["ManageGuild"], targetScope: "workflow-owned-empty-voice-channel-on-internal-event", risk: "owned-empty-voice-delete",
+    approval: { required: false, binds: ["guildId", "workflowId", "voiceChannelId", "verifiedEmpty"] }, effects: ["workflow-owned-empty-voice-channel.delete"],
+  },
   "workflow.channel.get_members": workflowActionSkill("channel.get_members"),
   "workflow.role.rename": workflowActionSkill("role.rename"),
   "workflow.role.member_count": workflowActionSkill("role.member_count"),

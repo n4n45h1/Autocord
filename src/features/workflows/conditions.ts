@@ -9,6 +9,7 @@ export type WorkflowConditionContext = {
   voice?: { memberCount: number; sessionExists: boolean };
   roleNames: ReadonlySet<string>;
   permissions: ReadonlySet<string>;
+  ownerPermissions?: ReadonlySet<string>;
 };
 
 export function evaluateWorkflowCondition(condition: WorkflowCondition, context: WorkflowConditionContext): boolean {
@@ -34,6 +35,7 @@ export function evaluateWorkflowCondition(condition: WorkflowCondition, context:
     case "state.not_exists": return !Object.hasOwn(context.states, `${condition.scope}:${condition.key}`);
     case "member.has_role": return context.roleNames.has(condition.roleName);
     case "member.has_permission": return context.permissions.has(condition.permission);
+    case "workflow.owner_has_permission": return context.ownerPermissions?.has(condition.permission) === true;
     case "time.within": return Date.now() >= Date.parse(condition.startAt) && Date.now() < Date.parse(condition.endAt);
     case "random.chance": return randomInt(0, 10_000) < condition.percent * 100;
     case "result.equals": {
