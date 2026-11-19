@@ -1,6 +1,8 @@
 import { performance } from "node:perf_hooks";
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, type ClientOptions } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
+
+type RestResponse = Awaited<ReturnType<NonNullable<NonNullable<ClientOptions["rest"]>["makeRequest"]>>>;
 
 describe("Discord REST 429 Retry-After backoff", () => {
   it("respects consecutive fractional Retry-After headers before recovering", async () => {
@@ -32,13 +34,13 @@ describe("Discord REST 429 Retry-After backoff", () => {
               "X-RateLimit-Scope": "user",
             },
           },
-        );
+        ) as unknown as RestResponse;
       }
 
       return new Response(
         JSON.stringify({ id: "222222222222222222", content: "recovered" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+      ) as unknown as RestResponse;
     });
 
     const client = new Client({
