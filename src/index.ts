@@ -2,14 +2,15 @@ import "dotenv/config";
 import { randomInt, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import {
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Events,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, Events,
   ChannelType, GatewayIntentBits, ModalBuilder, Partials, PermissionFlagsBits, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
   type ChatInputCommandInteraction, type GuildMember, type InteractionReplyOptions, type MessageCreateOptions, type ModalSubmitInteraction, type Role,
 } from "discord.js";
 import { and, eq, gt, ilike, inArray, lte, or, sql } from "drizzle-orm";
 import { db, pool } from "./db/client.js";
 import { agentJobs, agentJobSteps, auditEvents, giveaways, giveawayEntries, giveawayNotifications, guildSettings, interactiveWorkflows, managedChannels, managedRoles, panelOptions, panelRevisions, panels, usageRecords } from "./db/schema.js";
-import { makePlan, type AgentMode } from "./agent/planner.js";
+import { makePlan, type AgentMode, type PlanResult } from "./agent/planner.js";
+import { interactiveWorkflowSummary } from "./features/workflows/preview.js";
 import { orderResourceSteps, type MaxWorkflowOperation, type ResourceWorkflowStep } from "./agent/workflow.js";
 import { panelPlanSchema, type PanelPlan } from "./agent/plan.js";
 import { failUsageReservation, finishUsage, reserveUsage, type UsageReservation } from "./agent/core/usage.js";
@@ -131,64 +132,63 @@ async function assertWorkflowVoiceBindings(guild: import("discord.js").Guild, wo
   }
 }
 
-function interactiveWorkflowSummary(workflow: InteractiveWorkflow): string {
-  const effect = (step: InteractiveWorkflowStep): string => {
-    switch (step.action) {
-      case "entry.join": return `entry.join ${step.collection} max=${step.maxEntries}`;
-      case "entry.leave": return `entry.leave ${step.collection}`;
-      case "state.set": return `state.set ${step.scope}:${step.key}`;
-      case "role.grant": return `role.grant ${step.roleName} to trigger member`;
-      case "role.revoke": return `role.revoke ${step.roleName} from trigger member`;
-      case "message.send": return `message.send ${step.delivery === "workflow_owner_dm" ? "Workflow owner DM (private)" : "workflow channel (public)"}`;
-      case "message.edit": return "message.edit Workflow panel display";
-      case "panel.refresh": return "panel.refresh rendered state/components";
-      case "voice.channel.create": return `voice.channel.create ${step.name}; moveMembers=${step.moveMembers}; copy source permission overwrites`;
-      case "voice.channel.delete": return "voice.channel.delete Workflow-owned channel when empty";
-      case "resource.role.create": return `resource.role.create ${step.name} (no permissions)`;
-      case "resource.channel.create_category": return `resource.channel.create_category ${step.name} (Guild default permissions)`;
-      case "resource.channel.create_text": return `resource.channel.create_text ${step.name}${step.categoryStepId ? ` under category step ${step.categoryStepId}` : ""} (Guild default permissions)`;
-      case "giveaway.create": return `giveaway.create ${step.prize}; ${step.winnerCount} winners; ${step.durationSeconds}s`;
-      case "giveaway.join": return `giveaway.join ${step.giveawayId} for trigger member`;
-      case "giveaway.leave": return `giveaway.leave ${step.giveawayId} for trigger member`;
-      case "giveaway.end": return `giveaway.end ${step.giveawayId}`;
-      case "giveaway.pause": return `giveaway.pause ${step.giveawayId}`;
-      case "giveaway.resume": return `giveaway.resume ${step.giveawayId}`;
-      case "giveaway.reroll": return `giveaway.reroll ${step.giveawayId}`;
-      default: return JSON.stringify(step);
-    }
-  };
-  const componentSummary = workflow.components.map((component) => {
-    if (component.kind === "modal") return `modal:${component.key} (${component.inputs.map((input) => `${input.key}:${input.label}${input.required ? " required" : ""}`).join(", ")})`;
-    if (component.kind === "select") return `select:${component.key} (${component.options.length} options: ${component.options.slice(0, 5).map((option) => option.label).join(", ")}${component.options.length > 5 ? ", …" : ""})`;
-    return `button:${component.key} ${component.label} [${component.style}]`;
-  }).join("; ");
-  const triggerSummary = workflow.triggers.map((trigger) => {
-    const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const timing = trigger.event === "schedule" ? ` every ${trigger.intervalSeconds}s`
-      : trigger.event === "schedule.at" ? ` every ${weekdays[trigger.dayOfWeek]} ${String(trigger.hour).padStart(2, "0")}:${String(trigger.minute).padStart(2, "0")} ${trigger.timeZone}`
-        : trigger.event === "deadline" ? ` after ${trigger.afterSeconds}s` : "";
-    const voiceSource = "voiceChannelId" in trigger ? ` sourceVoice=${trigger.voiceChannelId}` : "";
-    const steps = trigger.steps.map((step) => `${step.id}: ${effect(step)}${step.dependsOn.length ? ` after[${step.dependsOn.join(",")}]` : ""}${step.when ? ` when ${JSON.stringify(step.when)}` : ""}`).join(" → ");
-    return `• ${trigger.event}${"componentKey" in trigger ? `(${trigger.componentKey})` : ""}${voiceSource}${timing}: ${steps}`;
-  }).join("\n");
-  return `${workflow.name}\nUI: ${componentSummary}\nTriggers and side effects:\n${triggerSummary}`;
-}
-
 function interactiveWorkflowDiff(before: InteractiveWorkflow, after: InteractiveWorkflow, version: number): string {
   return `更新: ${before.name} v${version} → ${after.name} v${version + 1}\n${interactiveWorkflowSummary(after)}`;
 }
 
-function preview(plan: PanelPlan | null, jobId: string, before?: PanelPlan, workflowSteps?: MaxWorkflowOperation[], resourceSteps?: ResourceWorkflowStep[], interactiveWorkflow?: InteractiveWorkflow, beforeWorkflow?: InteractiveWorkflow, workflowVersion?: number): InteractionReplyOptions {
-  const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`approve:${jobId}`).setLabel("承認して実行").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`deny:${jobId}`).setLabel("却下").setStyle(ButtonStyle.Secondary),
-  );
+function reasoningAudit(diagnostics: PlanResult["diagnostics"]): Record<string, unknown> | undefined {
+  const details = diagnostics?.reasoner ?? diagnostics?.shadowReasoner;
+  if (!details) return undefined;
+  const coverage = Array.isArray(details.coverage) ? details.coverage as { status?: string }[] : [];
+  return {
+    engine: details.engine ?? "ARE-1.0",
+    reasoningMode: details.reasoningMode ?? null,
+    failureClass: details.failureClass ?? null,
+    calls: details.calls ?? null,
+    repairs: details.repairs ?? null,
+    elapsedMs: details.elapsedMs ?? null,
+    mappedRequirements: coverage.filter((entry) => entry.status === "mapped_unverified" || entry.status === "satisfied_by_adapter").length,
+    totalRequirements: coverage.length,
+    unresolvedScenarioCount: Array.isArray(details.unresolved) ? details.unresolved.length : null,
+    sideEffectCount: Array.isArray(details.sideEffects) ? details.sideEffects.length : null,
+  };
+}
+
+function preview(plan: PanelPlan | null, jobId: string, before?: PanelPlan, workflowSteps?: MaxWorkflowOperation[], resourceSteps?: ResourceWorkflowStep[], interactiveWorkflow?: InteractiveWorkflow, beforeWorkflow?: InteractiveWorkflow, workflowVersion?: number, assurance?: Record<string, unknown>): InteractionReplyOptions {
+  const chunks: string[] = [];
+  const appendChunk = (text: string, maxLength: number) => {
+    let remaining = Array.from(text);
+    while (remaining.length > maxLength) {
+      let split = remaining.slice(0, maxLength).lastIndexOf("\n");
+      if (split < maxLength * 0.6) split = maxLength;
+      chunks.push(remaining.slice(0, split).join(""));
+      remaining = remaining.slice(split);
+      if (remaining[0] === "\n") remaining = remaining.slice(1);
+    }
+    if (remaining.length) chunks.push(remaining.join(""));
+  };
   const title = plan ? `Agentcord ${plan.intent === "create" ? "作成" : "編集"}プレビュー` : interactiveWorkflow ? "Agentcord Interactive Workflowプレビュー" : "Agentcord リソース作成プレビュー";
   const diff = plan ? planDiff(before, plan) : interactiveWorkflow ? beforeWorkflow ? interactiveWorkflowDiff(beforeWorkflow, interactiveWorkflow, workflowVersion ?? 1) : interactiveWorkflowSummary(interactiveWorkflow) : resourceSteps?.map(resourceStepSummary).join("\n") ?? "";
   const panelSteps = workflowSteps?.length ? `\n\n**Max Workflow**\n${workflowSteps.map((step, index) => `${index + 1}. ${step.id}: ${step.action}${step.dependsOn.length ? ` (after ${step.dependsOn.join(", ")})` : ""}`).join("\n")}` : "";
   const guildSteps = resourceSteps?.length ? `\n\n**Max Resource Skills**\n${resourceSteps.map((step, index) => `${index + 1}. ${step.id}: ${resourceStepSummary(step)}${step.dependsOn.length ? ` (after ${step.dependsOn.join(", ")})` : ""}`).join("\n")}` : "";
-  const content = `**${title}**\n${diff}${panelSteps}${guildSteps}\n\nジョブ: \`${jobId}\`\n10分以内に管理者が承認してください。`;
-  return { content: content.length > 1900 ? `${content.slice(0, 1880)}\n…（詳細は省略。登録Skills/副作用の一覧を確認してください）` : content, components: [row], allowedMentions: { parse: [] } };
+  const coverageEntries = Array.isArray(assurance?.coverage) ? assurance.coverage as { status?: string }[] : [];
+  const covered = coverageEntries.filter((entry) => entry.status === "mapped_unverified" || entry.status === "satisfied_by_adapter").length;
+  const coverage = `${covered}/${coverageEntries.length}`;
+  const unverified = Array.isArray(assurance?.semanticChecks) ? assurance.semanticChecks.length : 0;
+  const unresolved = Array.isArray(assurance?.unresolved) ? assurance.unresolved.length : 0;
+  const sideEffects = Array.isArray(assurance?.sideEffects) ? (assurance.sideEffects as { elementId: string; kind: string; authorizedBy: string[]; requiredAuxiliary: boolean }[]).map((effect) => `${effect.elementId}: ${effect.kind}${effect.requiredAuxiliary ? " (runtime-required)" : ` [${effect.authorizedBy.join(",") || "UNAUTHORIZED"}]`}`).join("; ") : "";
+  const effectSummary = sideEffects ? `\n副作用内訳: ${sideEffects}` : "";
+  const assuranceSummary = assurance ? `\n\n**ARE検証**: 要件追跡 ${coverage}、意味検証未保証 ${unverified}件、Dry Run未確定 ${unresolved}件。${effectSummary}` : "";
+  const details = `${diff}${panelSteps}${guildSteps}${assuranceSummary}`;
+  appendChunk(details, 2800);
+  const complete = chunks.length <= 2;
+  const row = complete ? new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`approve:${jobId}`).setLabel("承認して実行").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`deny:${jobId}`).setLabel("却下").setStyle(ButtonStyle.Secondary),
+  ) : null;
+  const content = `**${title}**\nジョブ: \`${jobId}\`\n${complete ? "変更点と副作用を全件表示しています。10分以内に管理者が承認してください。" : "プレビューがDiscordの表示上限を超えました。全副作用を表示できないため、この計画の承認は無効です。依頼を分割してください。"}`;
+  const embeds = chunks.slice(0, 2).map((chunk, index) => new EmbedBuilder().setDescription(`${chunks.length > 1 ? `(${index + 1}/${Math.min(chunks.length, 2)})\n` : ""}${chunk}`));
+  return { content, embeds, components: row ? [row] : [], allowedMentions: { parse: [] } };
 }
 
 type PlanInteraction = Pick<ChatInputCommandInteraction, "guild" | "guildId" | "user" | "channel" | "channelId" | "followUp" | "editReply"> | Pick<ModalSubmitInteraction, "guild" | "guildId" | "user" | "channel" | "channelId" | "followUp" | "editReply">;
@@ -203,18 +203,19 @@ async function savePlanClarification(input: {
   model?: string;
   inputTokens?: number;
   outputTokens?: number;
+  reasoning?: Record<string, unknown>;
 }): Promise<void> {
-  const { interaction, jobId, reservation, clarification, selectedPanel, selectedWorkflow } = input;
+  const { interaction, jobId, reservation, clarification, selectedPanel, selectedWorkflow, reasoning } = input;
   const explanation = [
     clarification.missingSkills.length ? "要求を満たすSkillsが未実装です。別機能のPlanには置き換えません。" : "Planを公開する前に、次の確認事項への回答が必要です。",
     ...clarification.questions.map((question, index) => `${index + 1}. ${question}`),
     ...(clarification.missingSkills.length ? [`開発者向けSkills提案: ${clarification.missingSkills.join("、")}`] : []),
   ].join("\n");
-  const clarificationContext = { clarification, panelId: selectedPanel?.id ?? null, expectedPanelRevision: selectedPanel?.revision ?? null, workflowId: selectedWorkflow?.id ?? null, expectedWorkflowVersion: selectedWorkflow?.version ?? null };
+  const clarificationContext = { clarification, panelId: selectedPanel?.id ?? null, expectedPanelRevision: selectedPanel?.revision ?? null, workflowId: selectedWorkflow?.id ?? null, expectedWorkflowVersion: selectedWorkflow?.version ?? null, reasoning };
   const components = clarification.missingSkills.length ? [] : [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(`clarify:${jobId}`).setLabel("確認事項に回答").setStyle(ButtonStyle.Primary))];
   await db.update(agentJobs).set({ state: "NEEDS_INPUT", executionContext: clarificationContext, updatedAt: new Date() })
     .where(and(eq(agentJobs.id, jobId), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "PLANNING")));
-  await db.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "plan.needs_input", outcome: clarification.missingSkills.length ? "missing_skills" : "clarification", detail: { questions: clarification.questions.length, missingSkills: clarification.missingSkills } });
+  await db.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "plan.needs_input", outcome: clarification.missingSkills.length ? "missing_skills" : "clarification", detail: { questions: clarification.questions.length, missingSkills: clarification.missingSkills, reasoning } });
   if (reservation) await finishUsage(reservation, input.model ?? "requirements-validator", input.inputTokens ?? 0, input.outputTokens ?? 0);
   await interaction.editReply({ content: explanation, components, allowedMentions: { parse: [] } });
 }
@@ -222,8 +223,9 @@ async function savePlanClarification(input: {
 async function writePlan(interaction: PlanInteraction, jobId: string, instruction: string, mode: AgentMode, selectedPanel?: typeof panels.$inferSelect, reservation?: UsageReservation, selectedWorkflow?: typeof interactiveWorkflows.$inferSelect): Promise<boolean> {
   const existing = selectedPanel ? stablePanelPlan(panelPlanSchema.parse(selectedPanel.spec), selectedPanel.id, selectedPanel.revision) : undefined;
   try {
+    const useReasoner = mode === "max" && process.env.AGENTCORD_REASONER_MODE === "on";
     const existingWorkflowSpec = selectedWorkflow ? interactiveWorkflowSchema.parse(selectedWorkflow.spec) : undefined;
-    const requestRequirements = analyzeRequestRequirements(instruction);
+    const requestRequirements = useReasoner ? null : analyzeRequestRequirements(instruction);
     const managedRoleBindings = await db.select({ roleId: managedRoles.roleId }).from(managedRoles).where(eq(managedRoles.guildId, interaction.guildId!));
     const availableManagedRoles: string[] = [];
     for (const binding of managedRoleBindings) {
@@ -233,28 +235,28 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
     const allChannels = await interaction.guild!.channels.fetch();
     const allVoiceChannels = [...allChannels.values()].flatMap((channel) => channel && channel.type === ChannelType.GuildVoice ? [{ id: channel.id, name: channel.name, category: channel.parent?.name ?? null }] : []);
     const namedVoiceChannels = allVoiceChannels.filter((channel) => instruction.toLocaleLowerCase().includes(channel.name.toLocaleLowerCase()));
-    if (requestRequirements.voiceRequested && !allVoiceChannels.length) {
+    if (requestRequirements?.voiceRequested && !allVoiceChannels.length) {
       await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: ["先に参加者が集まるVoice Lobbyをサーバーへ作成してください。その後、/agentのworkflow_idまたはLobby名を指定して再依頼してください。"], missingSkills: [] } });
       return false;
     }
-    if (requestRequirements.voiceRequested && allVoiceChannels.length > 1 && namedVoiceChannels.length !== 1) {
+    if (requestRequirements?.voiceRequested && allVoiceChannels.length > 1 && namedVoiceChannels.length !== 1) {
       await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: [`どのVoice Lobbyを監視しますか？候補: ${allVoiceChannels.map((channel) => channel.name).join("、")}`], missingSkills: [] } });
       return false;
     }
-    const availableVoiceChannels = requestRequirements.voiceRequested && namedVoiceChannels.length === 1 ? namedVoiceChannels : allVoiceChannels;
+    const availableVoiceChannels = requestRequirements?.voiceRequested && namedVoiceChannels.length === 1 ? namedVoiceChannels : allVoiceChannels;
     const availableStaffRoles = [...interaction.guild!.roles.cache.values()].filter((role) => role.id !== interaction.guildId && !role.managed).map((role) => ({ id: role.id, name: role.name }));
-    const result = await makePlan(instruction, existing, mode, selectedWorkflow ? { id: selectedWorkflow.id, version: selectedWorkflow.version, spec: existingWorkflowSpec! } : undefined, availableManagedRoles, availableVoiceChannels, availableStaffRoles);
+    const result = await makePlan(instruction, existing, mode, selectedWorkflow ? { id: selectedWorkflow.id, version: selectedWorkflow.version, spec: existingWorkflowSpec! } : undefined, availableManagedRoles, availableVoiceChannels, availableStaffRoles, [...allChannels.keys()]);
     const actor = await interaction.guild!.members.fetch(interaction.user.id);
 
     if (result.clarification) {
-      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: result.clarification, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
+      await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: result.clarification, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, reasoning: reasoningAudit(result.diagnostics) });
       return false;
     }
-    if (requestRequirements.voiceRequested && !availableVoiceChannels.length) {
+    if (requestRequirements?.voiceRequested && !availableVoiceChannels.length) {
       await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: ["募集の参加者が集まる既存Voice Lobbyを作成し、Workflow ID autocompleteから再依頼してください。"], missingSkills: [] }, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
       return false;
     }
-    const targetIssues = validatePlanTargetAgainstRequest(instruction, result.interactiveWorkflow ? "interactive" : result.resourceSteps ? "resources" : "panel");
+    const targetIssues = useReasoner ? [] : validatePlanTargetAgainstRequest(instruction, result.interactiveWorkflow ? "interactive" : result.resourceSteps ? "resources" : "panel");
     if (targetIssues.length) {
       await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: targetIssues, missingSkills: [] }, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
       return false;
@@ -272,10 +274,10 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
           .where(and(eq(agentJobs.id, jobId), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "PLANNING"))).returning({ id: agentJobs.id });
         if (saved.length !== 1) throw new Error("ジョブ状態が変化しました。もう一度依頼してください。");
         await tx.insert(agentJobSteps).values(workflow.steps.map((step, sequence) => ({ id: randomUUID(), jobId, guildId: interaction.guildId!, stepId: step.id, sequence, skillId: resolveResourceSkill(step), state: "PENDING", input: step })));
-        await tx.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "resource.workflow.created", outcome: "success", detail: { planHash: hash, mode, model: result.model, stepCount: workflow.steps.length, skillIds: workflow.steps.map(resolveResourceSkill) } });
+        await tx.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "resource.workflow.created", outcome: "success", detail: { planHash: hash, mode, model: result.model, stepCount: workflow.steps.length, skillIds: workflow.steps.map(resolveResourceSkill), reasoning: reasoningAudit(result.diagnostics) } });
       });
       if (reservation) await finishUsage(reservation, result.model, result.inputTokens, result.outputTokens);
-      await interaction.followUp({ ...preview(null, jobId, undefined, undefined, workflow.steps), ephemeral: true });
+      await interaction.followUp({ ...preview(null, jobId, undefined, undefined, workflow.steps, undefined, undefined, undefined, result.diagnostics?.reasoner), ephemeral: true });
       return true;
     }
 
@@ -285,7 +287,7 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
       const destination = workflowChannelId ? interaction.guild!.channels.cache.get(workflowChannelId) ?? await interaction.guild!.channels.fetch(workflowChannelId).catch(() => null) : null;
       if (!destination?.isSendable() || !workflowChannelId) throw new Error("Workflowの公開/更新チャンネルに送信できません。");
       const workflow = compileInteractiveWorkflow(result.interactiveWorkflow);
-      const requirementIssues = validateWorkflowAgainstRequest(instruction, workflow);
+      const requirementIssues = useReasoner ? [] : validateWorkflowAgainstRequest(instruction, workflow);
       if (requirementIssues.length) {
         await savePlanClarification({ interaction, jobId, reservation, selectedPanel, selectedWorkflow, clarification: { questions: requirementIssues, missingSkills: [] }, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens });
         return false;
@@ -310,10 +312,10 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
             skillId: `workflow.${step.action}`, state: "DEFINED", input: { triggerId: trigger.id, componentKey: "componentKey" in trigger ? trigger.componentKey : null, event: trigger.event, step },
           }))),
         ]);
-        await tx.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: workflowIntent === "create" ? "workflow.plan.created" : "workflow.plan.update", outcome: "success", detail: { planHash: hash, model: result.model, workflowId: selectedWorkflow?.id ?? null, workflowName: workflow.name, version: selectedWorkflow?.version ?? workflow.version, componentCount: workflow.components.length, triggerCount: workflow.triggers.length } });
+        await tx.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: workflowIntent === "create" ? "workflow.plan.created" : "workflow.plan.update", outcome: "success", detail: { planHash: hash, model: result.model, workflowId: selectedWorkflow?.id ?? null, workflowName: workflow.name, version: selectedWorkflow?.version ?? workflow.version, componentCount: workflow.components.length, triggerCount: workflow.triggers.length, reasoning: reasoningAudit(result.diagnostics) } });
       });
       if (reservation) await finishUsage(reservation, result.model, result.inputTokens, result.outputTokens);
-      await interaction.followUp({ ...preview(null, jobId, undefined, undefined, undefined, workflow, existingWorkflowSpec, selectedWorkflow?.version), ephemeral: true });
+      await interaction.followUp({ ...preview(null, jobId, undefined, undefined, undefined, workflow, existingWorkflowSpec, selectedWorkflow?.version, result.diagnostics?.reasoner), ephemeral: true });
       return true;
     }
 
@@ -337,11 +339,11 @@ async function writePlan(interaction: PlanInteraction, jobId: string, instructio
         .where(and(eq(agentJobs.id, jobId), eq(agentJobs.guildId, interaction.guildId!), eq(agentJobs.state, "PLANNING"))).returning({ id: agentJobs.id });
       if (saved.length !== 1) throw new Error("ジョブ状態が変化しました。もう一度依頼してください。");
       await tx.insert(agentJobSteps).values(planSteps.map((step, sequence) => ({ id: randomUUID(), jobId, guildId: interaction.guildId!, stepId: step.stepId, sequence, skillId: step.skillId, state: "PENDING", input: step.input })));
-      await tx.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "plan.created", outcome: "success", detail: { planHash: hash, mode, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, beforeRevision: selectedPanel?.revision ?? null, workflowSteps: result.workflowSteps?.map(({ id, action, dependsOn }) => ({ id, action, dependsOn })) } });
+      await tx.insert(auditEvents).values({ id: randomUUID(), jobId, guildId: interaction.guildId!, actorId: interaction.user.id, action: "plan.created", outcome: "success", detail: { planHash: hash, mode, model: result.model, inputTokens: result.inputTokens, outputTokens: result.outputTokens, beforeRevision: selectedPanel?.revision ?? null, workflowSteps: result.workflowSteps?.map(({ id, action, dependsOn }) => ({ id, action, dependsOn })), reasoning: reasoningAudit(result.diagnostics) } });
     });
     const reservationRow = reservation ? await db.select().from(usageRecords).where(eq(usageRecords.id, reservation.id)).limit(1) : [];
     if (reservation && reservationRow.length) await finishUsage(reservation, result.model, result.inputTokens, result.outputTokens);
-    await interaction.followUp({ ...preview(plan, jobId, existing, result.workflowSteps), ephemeral: true });
+    await interaction.followUp({ ...preview(plan, jobId, existing, result.workflowSteps, undefined, undefined, undefined, undefined, result.diagnostics?.reasoner), ephemeral: true });
     return true;
   } catch (error) {
     if (reservation) await failUsageReservation(reservation);

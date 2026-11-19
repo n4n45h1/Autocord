@@ -1,7 +1,32 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../../db/client.js";
-import { workflowCollections, workflowDebitClaims, workflowStates } from "../../db/schema.js";
+import { workflowCollections, workflowDebitClaims, workflowEntries, workflowStates } from "../../db/schema.js";
+
+export async function joinWorkflowEntry(input: { workflowId: string; collection: string; userId: string; maxEntries: number }): Promise<{ joined: boolean; duplicate: boolean; count: number; full: boolean }> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${input.workflowId}:${input.collection}`}))`);
+    const prior = await tx.select({ userId: workflowEntries.userId }).from(workflowEntries).where(and(
+      eq(workflowEntries.workflowId, input.workflowId), eq(workflowEntries.collection, input.collection), eq(workflowEntries.userId, input.userId),
+    )).limit(1);
+    const [row] = await tx.select({ count: sql<number>`count(*)::int` }).from(workflowEntries).where(and(eq(workflowEntries.workflowId, input.workflowId), eq(workflowEntries.collection, input.collection)));
+    const count = row?.count ?? 0;
+    if (prior.length) return { joined: false, duplicate: true, count, full: count >= input.maxEntries };
+    if (count >= input.maxEntries) return { joined: false, duplicate: false, count, full: true };
+    await tx.insert(workflowEntries).values({ workflowId: input.workflowId, collection: input.collection, userId: input.userId }).onConflictDoNothing();
+    const nextCount = count + 1;
+    return { joined: true, duplicate: false, count: nextCount, full: nextCount >= input.maxEntries };
+  });
+}
+
+export async function leaveWorkflowEntry(input: { workflowId: string; collection: string; userId: string }): Promise<{ left: boolean; count: number }> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`${input.workflowId}:${input.collection}`}))`);
+    const removed = await tx.delete(workflowEntries).where(and(eq(workflowEntries.workflowId, input.workflowId), eq(workflowEntries.collection, input.collection), eq(workflowEntries.userId, input.userId))).returning({ userId: workflowEntries.userId });
+    const [row] = await tx.select({ count: sql<number>`count(*)::int` }).from(workflowEntries).where(and(eq(workflowEntries.workflowId, input.workflowId), eq(workflowEntries.collection, input.collection)));
+    return { left: removed.length > 0, count: row?.count ?? 0 };
+  });
+}
 
 export async function mutateWorkflowNumber(input: {
   workflowId: string;

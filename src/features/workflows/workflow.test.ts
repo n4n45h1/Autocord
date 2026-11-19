@@ -53,6 +53,38 @@ describe("generic interactive Workflow definitions", () => {
     expect(selectWeighted([{ value: "warrior", weight: 3 }, { value: "mage", weight: 1 }], 3)).toBe("mage");
   });
 
+  it("composes button registrations into bounded group movement and internal empty-channel cleanup", () => {
+    const managerGuard = { op: "and", conditions: [
+      { op: "workflow.owner_has_permission", permission: "ManageGuild" },
+      { op: "workflow.owner_has_permission", permission: "ManageChannels" },
+    ] } as const;
+    const moveGuard = { op: "and", conditions: [
+      { op: "workflow.owner_has_permission", permission: "ManageGuild" },
+      { op: "workflow.owner_has_permission", permission: "MoveMembers" },
+    ] } as const;
+    const workflow = compileInteractiveWorkflow({
+      version: 1, name: "Party", title: "Party", description: "Join until two members have reserved.", color: "blue",
+      components: [{ key: "join", kind: "button", label: "Join", style: "success", emoji: null, disabledWhen: { op: "entries.gte", collection: "party", value: 2 }, triggerId: "join-trigger" }],
+      triggers: [
+        { id: "join-trigger", event: "button", componentKey: "join", steps: [
+          { id: "register", action: "entry.join", collection: "party", maxEntries: 2 },
+          { id: "create-room", action: "channel.create_voice", name: "Party", when: { op: "and", conditions: [...managerGuard.conditions, { op: "result.equals", stepId: "register", field: "joined", value: true }, { op: "result.equals", stepId: "register", field: "count", value: 2 }] }, dependsOn: ["register"] },
+          { id: "move-party", action: "channel.move_members", channelStepId: "create-room", collection: "party", maxMembers: 2, when: moveGuard, dependsOn: ["register", "create-room"] },
+          { id: "refresh-room", action: "panel.refresh", dependsOn: ["create-room", "move-party"] },
+        ] },
+        { id: "cleanup-trigger", event: "workflow.channel_empty", steps: [
+          { id: "delete-empty", action: "channel.delete_empty", dependsOn: [] },
+          { id: "refresh-cleanup", action: "panel.refresh", dependsOn: ["delete-empty"] },
+        ] },
+      ],
+    });
+    expect(workflow.triggers.some((trigger) => trigger.event === "workflow.channel_empty")).toBe(true);
+    expect(workflow.triggers[0]?.steps.map((step) => step.action)).toContain("channel.move_members");
+    const invalid = structuredClone(workflow);
+    invalid.triggers[0]!.steps.push({ id: "unsafe-cleanup", action: "channel.delete_empty", dependsOn: [] });
+    expect(() => compileInteractiveWorkflow(invalid)).toThrow(/internal workflow.channel_empty trigger/);
+  });
+
   it("keeps requested scenarios A-F distinct from currently executable primitives", () => {
     const scenarios = [
       ["B", "戦士・魔法使い・僧侶が選べるRPG。HP、攻撃力、経験値、レベル、ゴールド、戦闘とショップ", "workflow.turn_based_game_loop_and_transactional_shop"],

@@ -34,11 +34,37 @@ async function jsonRequest<T>(baseUrl: string, path: string, init: RequestInit, 
 }
 
 function parsePlanText(text: string): unknown {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const candidate = fenced ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  if (!candidate || candidate.startsWith("{") === false) throw Object.assign(new Error("OpenCode model response did not contain a JSON object."), { code: "INVALID_MODEL_JSON" });
-  try { return JSON.parse(candidate); }
-  catch { throw Object.assign(new Error("OpenCode model response contained invalid JSON."), { code: "INVALID_MODEL_JSON" }); }
+  const candidates = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map((match) => match[1]!.trim());
+  let sawObject = false;
+  for (let start = 0; start < text.length; start++) {
+    if (text[start] !== "{") continue;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let end = start; end < text.length; end++) {
+      const char = text[end]!;
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') inString = true;
+      else if (char === "{") { depth++; sawObject = true; }
+      else if (char === "}" && --depth === 0) {
+        candidates.push(text.slice(start, end + 1));
+        break;
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch { /* Try the next balanced object in the response. */ }
+  }
+  const error = sawObject ? "OpenCode model response contained invalid JSON." : "OpenCode model response did not contain a JSON object.";
+  throw Object.assign(new Error(error), { code: "INVALID_MODEL_JSON" });
 }
 
 export async function generateOpenCodePlan(prompt: string, model: string, timeoutMs: number): Promise<OpenCodePlanResult> {
@@ -75,8 +101,18 @@ export async function generateOpenCodePlan(prompt: string, model: string, timeou
         throw Object.assign(new Error(detail), { status: message.error?.status });
       }
       const text = message.content?.filter((part) => part.type === "text").map((part) => part.text ?? "").join("") ?? "";
+      let object: unknown;
+      try { object = parsePlanText(text); }
+      catch (error) {
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+          model: `${providerID}/${modelID}`,
+          inputTokens: message.tokens?.input ?? 0,
+          outputTokens: message.tokens?.output ?? 0,
+          responsePreview: text.slice(0, 300),
+        });
+      }
       return {
-        object: parsePlanText(text),
+        object,
         model: `${providerID}/${modelID}`,
         inputTokens: message.tokens?.input ?? 0,
         outputTokens: message.tokens?.output ?? 0,

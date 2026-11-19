@@ -18,6 +18,7 @@ const conditionLeaf = z.discriminatedUnion("op", [
   z.object({ op: z.literal("state.not_exists"), scope: z.enum(["workflow", "guild", "member"]), key }).strict(),
   z.object({ op: z.literal("member.has_role"), roleName: z.string().min(1).max(100) }).strict(),
   z.object({ op: z.literal("member.has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "MoveMembers", "Administrator"]) }).strict(),
+  z.object({ op: z.literal("workflow.owner_has_permission"), permission: z.enum(["ManageGuild", "ManageRoles", "ManageChannels", "MoveMembers", "Administrator"]) }).strict(),
   z.object({ op: z.literal("time.within"), startAt: z.string().datetime({ offset: true }), endAt: z.string().datetime({ offset: true }) }).strict().refine((condition) => Date.parse(condition.endAt) > Date.parse(condition.startAt), "time.within endAt must follow startAt"),
   z.object({ op: z.literal("random.chance"), percent: z.number().min(0).max(100) }).strict(),
   z.object({ op: z.literal("result.equals"), stepId: key, field: z.string().regex(/^[A-Za-z0-9._-]{1,40}$/), value: scalar }).strict(),
@@ -101,6 +102,8 @@ export const interactiveWorkflowStepSchema = z.discriminatedUnion("action", [
   z.object({ ...stepBase, action: z.literal("channel.delete"), channelStepId: key.nullable().default(null), channelId: z.string().max(100).nullable().default(null) }).strict().refine((step) => Boolean(step.channelStepId) !== Boolean(step.channelId), "channel.delete requires exactly one of channelStepId or channelId"),
   z.object({ ...stepBase, action: z.literal("channel.set_permission"), channelStepId: key, preset: z.enum(["private_member", "staff_only"]), staffRoleId: z.string().regex(/^\d{17,20}$/).nullable() }).strict().refine((step) => (step.preset === "staff_only") === Boolean(step.staffRoleId), "staff_only requires staffRoleId; private_member must omit it"),
   z.object({ ...stepBase, action: z.literal("channel.move_member"), channelStepId: key }).strict(),
+  z.object({ ...stepBase, action: z.literal("channel.move_members"), channelStepId: key, collection: key, maxMembers: z.number().int().min(1).max(50).default(20) }).strict(),
+  z.object({ ...stepBase, action: z.literal("channel.delete_empty") }).strict(),
   z.object({ ...stepBase, action: z.literal("channel.get_members"), channelStepId: key }).strict(),
   z.object({ ...stepBase, action: z.literal("role.rename"), roleName: z.string().min(1).max(100), name: z.string().min(1).max(100) }).strict(),
   z.object({ ...stepBase, action: z.literal("role.member_count"), roleName: z.string().min(1).max(100) }).strict(),
@@ -157,6 +160,7 @@ export const interactiveWorkflowTriggerSchema = z.discriminatedUnion("event", [
   z.object({ id: key, event: z.literal("voice.member_leave_event"), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.enum(["member.join", "member.leave"]), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.enum(["member.role_added", "member.role_removed"]), roleId: z.string().regex(/^\d{17,20}$/), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
+  z.object({ id: key, event: z.literal("workflow.channel_empty"), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.enum(["message.created", "message.deleted"]), channelId: z.union([z.string().regex(/^\d{17,20}$/), z.literal("workflow_channel")]), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
   z.object({ id: key, event: z.enum(["reaction.added", "reaction.removed"]), channelId: z.union([z.string().regex(/^\d{17,20}$/), z.literal("workflow_channel")]), messageStepId: key, emoji: z.string().min(1).max(100).nullable(), steps: z.array(interactiveWorkflowStepSchema).min(1).max(12) }).strict(),
 ]);
@@ -201,6 +205,10 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       if (!categoryStep || categoryStep.action !== "resource.channel.create_category") ctx.addIssue({ code: "custom", message: `Text channel ${step.id} references a missing category step.` });
       else if (!dependsOnAncestor(step.id, step.categoryStepId)) ctx.addIssue({ code: "custom", message: `Text channel ${step.id} must depend on category step ${step.categoryStepId}.` });
     }
+    for (const step of trigger.steps) if (step.action === "channel.move_members") {
+      const registered = workflow.triggers.some((candidate) => candidate.steps.some((entry) => entry.action === "entry.join" && entry.collection === step.collection));
+      if (!registered) ctx.addIssue({ code: "custom", message: `Batch movement ${step.id} must use a collection populated by entry.join.` });
+    }
     for (const step of trigger.steps) if (step.action === "role.grant" || step.action === "role.revoke") {
       const createdRole = trigger.steps.find((candidate) => candidate.action === "resource.role.create" && candidate.name === step.roleName);
       if (createdRole && !dependsOnAncestor(step.id, createdRole.id)) ctx.addIssue({ code: "custom", message: `Role operation ${step.id} must depend on Workflow role creation step ${createdRole.id}.` });
@@ -220,12 +228,14 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
         requireResultDependency(step.id, step.channelStepId, `Step ${step.id}`);
         const allowedTargets = step.action === "channel.set_permission" ? ["resource.channel.create_text", "channel.create_text"]
           : step.action === "message.send" ? ["resource.channel.create_text", "channel.create_text"]
-          : step.action === "channel.move_member" || step.action === "channel.get_members" ? ["channel.create_voice", "voice.channel.create"]
+          : step.action === "channel.move_member" || step.action === "channel.move_members" || step.action === "channel.get_members" ? ["channel.create_voice", "voice.channel.create"]
             : ["resource.channel.create_text", "resource.channel.create_category", "channel.create_voice", "channel.create_text", "voice.channel.create"];
         if (!target || !allowedTargets.includes(target.action)) ctx.addIssue({ code: "custom", message: `Step ${step.id} references an incompatible Workflow-created channel step.` });
       }
       if (step.action === "message.send" && step.delivery === "workflow_channel_step" && !step.channelStepId) ctx.addIssue({ code: "custom", message: "workflow_channel_step requires a channelStepId." });
       if (step.action === "message.reply" && trigger.event !== "message.created") ctx.addIssue({ code: "custom", message: "message.reply requires a message.created trigger context." });
+      if (step.action === "channel.delete_empty" && trigger.event !== "workflow.channel_empty") ctx.addIssue({ code: "custom", message: "channel.delete_empty is limited to the internal workflow.channel_empty trigger." });
+      if (trigger.event === "workflow.channel_empty" && step.action !== "channel.delete_empty" && step.action !== "message.send" && step.action !== "panel.refresh" && !step.action.startsWith("state.") && !step.action.startsWith("collection.")) ctx.addIssue({ code: "custom", message: `Internal channel-empty trigger cannot use ${step.action}.` });
       if (step.action === "message.dm" && trigger.event === "schedule" && step.recipient !== "workflow_owner") ctx.addIssue({ code: "custom", message: "Scheduled message.dm may only target the Workflow owner." });
       const conditions = conditionsOf(step.when);
       for (const condition of conditions) if (condition.op === "result.equals") requireResultDependency(step.id, condition.stepId, `Condition on ${step.id}`);
@@ -241,7 +251,7 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       }
       for (const step of ready) pending.delete(step.id);
     }
-    const panelMutationSteps = trigger.steps.filter((step) => stateMutationActions.includes(step.action) || collectionMutationActions.includes(step.action) || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "channel.create_voice", "channel.create_text", "channel.rename", "channel.delete", "channel.set_permission", "role.rename", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
+    const panelMutationSteps = trigger.steps.filter((step) => stateMutationActions.includes(step.action) || collectionMutationActions.includes(step.action) || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "channel.create_voice", "channel.create_text", "channel.rename", "channel.delete", "channel.delete_empty", "channel.set_permission", "role.rename", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action));
     if (panelMutationSteps.length) {
       const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
       if (!refresh) ctx.addIssue({ code: "custom", message: `Trigger ${trigger.id} must refresh its UI after changing Workflow-visible state/resources.` });
@@ -249,7 +259,7 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
     }
     if (trigger.event === "schedule" || trigger.event === "schedule.at" || trigger.event === "deadline") {
       for (const step of trigger.steps) {
-        if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke" || step.action === "role.rename" || step.action === "voice.channel.create" || step.action === "voice.channel.delete" || step.action.startsWith("channel.create_") || step.action === "channel.rename" || step.action === "channel.delete" || step.action === "channel.set_permission" || step.action === "channel.move_member" || step.action === "channel.create_text" || step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway.")) ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member/resource action ${step.action}.` });
+        if (step.action === "entry.join" || step.action === "entry.leave" || step.action === "role.grant" || step.action === "role.revoke" || step.action === "role.rename" || step.action === "voice.channel.create" || step.action === "voice.channel.delete" || step.action.startsWith("channel.create_") || step.action === "channel.rename" || step.action === "channel.delete" || step.action === "channel.delete_empty" || step.action === "channel.set_permission" || step.action === "channel.move_member" || step.action === "channel.move_members" || step.action === "channel.create_text" || step.action === "resource.role.create" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action.startsWith("giveaway.")) ctx.addIssue({ code: "custom", message: `Scheduled trigger cannot use member/resource action ${step.action}.` });
         if ((step.action.startsWith("state.") || step.action.startsWith("collection.")) && "scope" in step && step.scope === "member") ctx.addIssue({ code: "custom", message: "Scheduled triggers may not access member-scoped state or collections." });
         if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate VoiceState conditions." });
         if (step.when && conditionLeaves(step.when).some((condition) => condition.op === "member.has_role" || condition.op === "member.has_permission" || ("scope" in condition && condition.scope === "member"))) ctx.addIssue({ code: "custom", message: "Scheduled triggers cannot evaluate member-only conditions or member-scoped data." });
@@ -286,15 +296,17 @@ export const interactiveWorkflowSchema = interactiveWorkflowDraftSchema.superRef
       if (step.action === "voice.channel.create" || step.action === "voice.channel.delete") ctx.addIssue({ code: "custom", message: "Voice channel actions require VoiceState event triggers." });
       if (step.when && conditionUsesVoice(step.when)) ctx.addIssue({ code: "custom", message: "VoiceState conditions require VoiceState event triggers." });
       const requiredPermission = step.action === "resource.role.create" || step.action === "role.rename" ? "ManageRoles"
-        : step.action === "channel.move_member" ? "MoveMembers"
+        : step.action === "channel.move_member" || step.action === "channel.move_members" ? "MoveMembers"
         : step.action === "channel.create_text" && step.visibility === "guild_default" || step.action === "resource.channel.create_category" || step.action === "resource.channel.create_text" || step.action === "channel.create_voice" || step.action === "channel.rename" || step.action === "channel.set_permission" ? "ManageChannels"
           : step.action === "giveaway.create" || step.action === "giveaway.end" || step.action === "giveaway.reroll" || step.action === "giveaway.pause" || step.action === "giveaway.resume" ? "ManageRoles"
           : null;
       if (requiredPermission) {
         const conditions = step.when?.op === "and" ? step.when.conditions : [];
+        const allowWorkflowOwner = step.action === "channel.create_voice" || step.action === "channel.move_members";
+        const guarded = (permission: string) => conditions.some((condition) => (condition.op === "member.has_permission" || allowWorkflowOwner && condition.op === "workflow.owner_has_permission") && condition.permission === permission);
         if (step.when?.op !== "and") ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must use an AND permission guard.` });
-        if (!conditions.some((condition) => condition.op === "member.has_permission" && condition.permission === "ManageGuild")) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with member.has_permission ManageGuild.` });
-        if (!conditions.some((condition) => condition.op === "member.has_permission" && condition.permission === requiredPermission)) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with member.has_permission ${requiredPermission}.` });
+        if (!guarded("ManageGuild")) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with a ManageGuild permission condition for its acting principal.` });
+        if (!guarded(requiredPermission)) ctx.addIssue({ code: "custom", message: `Resource action ${step.action} must guard with a ${requiredPermission} permission condition for its acting principal.` });
       }
     }
     if (triggerKeys.has(trigger.componentKey)) ctx.addIssue({ code: "custom", message: `Only one trigger may bind to component ${trigger.componentKey}.` });
@@ -344,7 +356,7 @@ export function compileInteractiveWorkflow(input: unknown): InteractiveWorkflow 
   const compiled = structuredClone(workflow);
   const collections = new Set<string>();
   for (const trigger of compiled.triggers) {
-    const mutationStepIds = trigger.steps.filter((step) => stateMutationActions.includes(step.action) || collectionMutationActions.includes(step.action) || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "channel.create_voice", "channel.create_text", "channel.rename", "channel.delete", "channel.set_permission", "role.rename", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
+    const mutationStepIds = trigger.steps.filter((step) => stateMutationActions.includes(step.action) || collectionMutationActions.includes(step.action) || ["entry.join", "entry.leave", "resource.role.create", "resource.channel.create_category", "resource.channel.create_text", "channel.create_voice", "channel.create_text", "channel.rename", "channel.delete", "channel.delete_empty", "channel.set_permission", "role.rename", "giveaway.create", "giveaway.join", "giveaway.leave", "giveaway.end", "giveaway.pause", "giveaway.resume", "giveaway.reroll", "voice.channel.create", "voice.channel.delete"].includes(step.action)).map((step) => step.id);
     for (const step of trigger.steps) if (step.action === "entry.join" || step.action === "entry.leave") collections.add(step.collection);
     const refresh = trigger.steps.find((step) => step.action === "panel.refresh");
     if (refresh) refresh.dependsOn = [...new Set([...refresh.dependsOn, ...mutationStepIds])];

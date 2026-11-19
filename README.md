@@ -62,6 +62,15 @@ For the no-key OpenCode backend, run the Bot natively so it can reach the authen
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:4197` | Authenticated local OpenCode HTTP API |
 | `AGENTCORD_MINI_MODEL` | `river/deepseek-v4.1-flash` | Mini provider/model ID |
 | `AGENTCORD_MAX_MODEL` | `river/deepseek-v4.1-flash` | Max provider/model ID |
+| `AGENTCORD_REASONER_MODE` | `off` | ARE feature flag: `off` (legacy), `shadow` (run both, return legacy), `on` (ARE result) |
+| `AGENTCORD_REASONING_MODE` | `auto` | ARE effort: `auto`, `fast`, `deep`, or `research` |
+| `AGENTCORD_REASONER_MAX_CALLS` | `8` | ARE total model-call limit, including fallback attempts (clamped 2..12) |
+| `AGENTCORD_REASONER_MAX_CANDIDATES` | `3` | Bounded distinct candidate limit (clamped 1..3) |
+| `AGENTCORD_REASONER_MAX_REPAIRS` | `2` | Counterexample-guided repair limit per run (clamped 0..4) |
+| `AGENTCORD_REASONER_INPUT_TOKENS` | `120000` | ARE estimated/observed aggregate input token budget (clamped 10,000..120,000) |
+| `AGENTCORD_REASONER_OUTPUT_TOKENS` | `16000` | ARE output token budget (clamped 2,000..32,000) |
+| `AGENTCORD_REASONER_TIMEOUT_MS` | `90000` | ARE wall-clock budget (clamped 10,000..180,000 ms) |
+| `AGENTCORD_REASONER_CALL_TIMEOUT_MS` | `30000` | Per model-call wall-clock cap within the ARE total budget (clamped 5,000..60,000 ms) |
 | `OPENAI_COMPATIBLE_BASE_URL` | `https://api.opencode.ai/v1` | OpenAI-compatible endpoint when selected |
 | `AI_FALLBACK_MODEL` | empty | One fallback model after a primary failure |
 | `MINI_MONTHLY_LIMIT` / `MAX_MONTHLY_LIMIT` | `0` / `0` | Per-guild monthly limits; `0` means unlimited |
@@ -81,6 +90,8 @@ For the no-key OpenCode backend, run the Bot natively so it can reach the authen
 | `AI_INPUT_USD_PER_MILLION` / `AI_OUTPUT_USD_PER_MILLION` | `0` | Cost estimate rates |
 
 ## Verification
+
+ARE 1.0 is opt-in. Start with `AGENTCORD_REASONER_MODE=shadow`: legacy results remain authoritative while ARE diagnostics/cost are recorded with the plan; use `on` only after evaluating. The 100-case ARE set keeps a 20% holdout per category. Run a small paired tuning sample with `npm run eval:are -- reports/are-dev.jsonl 0 10 tuning both`; the last arguments select split (`all`, `tuning`, `holdout`) and method (`legacy`, `reasoner`, `both`). Semantic correctness is left unscored for blind review rather than inferred from Action-name presence. Do not tune against the `holdout` split.
 
 ```sh
 npm ci

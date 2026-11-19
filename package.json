@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "eval:max": "tsx src/agent/max-eval.ts",
+    "eval:are": "tsx src/agent/reasoner/evaluate.ts",
     "db:migrate": "tsx src/db/migrate.ts",
     "commands:deploy": "tsx src/deploy-commands.ts"
   },

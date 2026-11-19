@@ -6,12 +6,14 @@ import { agentSkills } from "./skills/registry.js";
 import { interactiveWorkflowStepSchema, interactiveWorkflowTriggerSchema } from "./interactive-workflow.js";
 import { structuredRequirementCatalog, validateStructuredRequirementCapabilities, type StructuredMaxRequirements } from "./structured-requirements.js";
 
-const mocks = vi.hoisted(() => ({ generateOpenCodePlan: vi.fn(), generateObject: vi.fn() }));
+const mocks = vi.hoisted(() => ({ generateOpenCodePlan: vi.fn(), generateObject: vi.fn(), makeReasonerPlan: vi.fn() }));
 vi.mock("./opencode.js", () => ({ generateOpenCodePlan: mocks.generateOpenCodePlan }));
+vi.mock("./reasoner/orchestrator.js", () => ({ makeReasonerPlan: mocks.makeReasonerPlan }));
 vi.mock("ai", () => ({ generateObject: mocks.generateObject }));
 
 const originalBackend = process.env.AI_BACKEND;
 const originalFallback = process.env.AI_FALLBACK_MODEL;
+const originalReasonerMode = process.env.AGENTCORD_REASONER_MODE;
 
 function inferRequirements(object: unknown): StructuredMaxRequirements {
   const output = object as { target?: string; workflow?: { operations?: { action: string }[]; steps?: { action: string }[]; triggers?: { event: string; steps: { action: string }[] }[] } };
@@ -53,13 +55,40 @@ function stateWorkflow() {
 afterEach(() => {
   mocks.generateOpenCodePlan.mockReset();
   mocks.generateObject.mockReset();
+  mocks.makeReasonerPlan.mockReset();
   if (originalBackend === undefined) delete process.env.AI_BACKEND;
   else process.env.AI_BACKEND = originalBackend;
   if (originalFallback === undefined) delete process.env.AI_FALLBACK_MODEL;
   else process.env.AI_FALLBACK_MODEL = originalFallback;
+  if (originalReasonerMode === undefined) delete process.env.AGENTCORD_REASONER_MODE;
+  else process.env.AGENTCORD_REASONER_MODE = originalReasonerMode;
 });
 
 describe("Agentcord Max requirement routing and plan verification", () => {
+  it("routes Max through ARE when enabled without invoking the legacy generator", async () => {
+    process.env.AGENTCORD_REASONER_MODE = "on";
+    const expected = { plan: null, model: "mock/are", inputTokens: 1, outputTokens: 2, clarification: { questions: ["incomplete"], missingSkills: [] }, diagnostics: { reasoner: { engine: "ARE-1.0" } } };
+    mocks.makeReasonerPlan.mockResolvedValue(expected);
+    const result = await makePlan("Create an automation", undefined, "max");
+    expect(result).toEqual(expected);
+    expect(mocks.makeReasonerPlan).toHaveBeenCalledWith("Create an automation", "max", expect.objectContaining({ availableManagedRoles: [], availableVoiceChannels: [], availableStaffRoles: [], availableChannelIds: [] }));
+    expect(mocks.generateOpenCodePlan).not.toHaveBeenCalled();
+  });
+
+  it("runs shadow ARE diagnostics while returning the legacy Max plan", async () => {
+    process.env.AI_BACKEND = "opencode-server";
+    process.env.AGENTCORD_REASONER_MODE = "shadow";
+    const legacyWorkflow = stateWorkflow().workflow;
+    response({ target: "interactive", workflow: legacyWorkflow });
+    mocks.makeReasonerPlan.mockResolvedValue({ plan: null, model: "mock/are", inputTokens: 7, outputTokens: 8, clarification: { questions: ["ARE alternative"], missingSkills: [] }, diagnostics: { reasoner: { engine: "ARE-1.0" } } });
+    const result = await makePlan("Store a preference", undefined, "max");
+    expect(result.interactiveWorkflow?.name).toBe("Preferences");
+    expect(result.clarification).toBeUndefined();
+    expect(result.inputTokens).toBe(22);
+    expect(result.outputTokens).toBe(23);
+    expect(result.diagnostics?.shadowReasoner?.outcomeAgreement).toBe(false);
+  });
+
   it("fails closed on invalid structured requirement output", async () => {
     process.env.AI_BACKEND = "opencode-server";
     mocks.generateOpenCodePlan

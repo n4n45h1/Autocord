@@ -29,6 +29,8 @@ export type PlanResult = {
     repairAttempts?: number;
     validationIssues?: string[];
     attempts?: { attempt: number; target?: string; outputShape?: { keys: string[]; target?: unknown; hasWorkflow: boolean }; actions?: string[]; triggers?: string[]; components?: unknown; candidateGraph?: unknown; issues: string[] }[];
+    reasoner?: Record<string, unknown>;
+    shadowReasoner?: Record<string, unknown>;
   };
 };
 
@@ -111,7 +113,9 @@ function normalizeMaxWorkflowOutput(value: unknown, targetHint?: StructuredMaxRe
   if (targetHint && !validTargets.has(String(wrapped.target)) && wrapped.workflow && typeof wrapped.workflow === "object" && !Array.isArray(wrapped.workflow)) wrapped = { ...wrapped, target: targetHint };
   if (wrapped.target !== "interactive" || !wrapped.workflow || typeof wrapped.workflow !== "object" || Array.isArray(wrapped.workflow)) return wrapped;
   const normalizeTemplateAliases = (value: unknown): unknown => {
-    if (typeof value === "string") return value.replace(/\{\{(?:member|user|interaction:member):(?:id|mention)\}\}/g, "{{actor}}");
+    if (typeof value === "string") return value
+      .replace(/\{\{(?:member|user|interaction:member):(?:id|mention)\}\}/g, "{{actor}}")
+      .replace(/\{\{steps\.([a-z0-9._-]+)\.([A-Za-z0-9._-]+)\}\}/g, "{{result:$1:$2}}");
     if (Array.isArray(value)) return value.map(normalizeTemplateAliases);
     if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, normalizeTemplateAliases(child)]));
     return value;
@@ -158,7 +162,7 @@ function normalizeStructuredRequirements(extracted: StructuredMaxRequirements, r
   let target = extracted.target;
   if (request.contactForm || request.giveawayRequested || request.pointsRequested || request.privateTicketRequested || request.voteRequested || request.voiceRequested || request.recruitmentCap !== null || request.unifiedResourceInteraction || extracted.requiredActions.some((action) => ["state.debit", "workflow.wait", "channel.create_text", "channel.create_voice"].includes(action)) || extracted.requiredTriggers.some((trigger) => !["button", "select", "modal_submit"].includes(trigger))) target = "interactive";
   else if (request.resourceCreate) target = "resources";
-  const conditionOperators = new Set(["number.eq", "number.gt", "number.gte", "number.lt", "number.lte", "math.eq", "math.gte", "string.equals", "string.contains", "string.starts_with", "list.contains", "state.exists", "state.not_exists", "member.has_role", "member.has_permission", "time.within", "random.chance", "result.equals", "voice.members.gte", "voice.members.eq", "voice.session.exists", "and", "or", "not"]);
+  const conditionOperators = new Set(["number.eq", "number.gt", "number.gte", "number.lt", "number.lte", "math.eq", "math.gte", "string.equals", "string.contains", "string.starts_with", "list.contains", "state.exists", "state.not_exists", "member.has_role", "member.has_permission", "workflow.owner_has_permission", "time.within", "random.chance", "result.equals", "voice.members.gte", "voice.members.eq", "voice.session.exists", "and", "or", "not"]);
   const triggerNames = new Set<string>(structuredRequirementCatalog.triggers);
   const actions = new Set<string>(extracted.requiredActions.map(normalizeAction).filter((action) => !triggerNames.has(action)).filter((action) => target !== "interactive" || !action.startsWith("panel.") && !action.startsWith("option.")).filter((action) => !conditionOperators.has(action)));
   if (target === "interactive") {
@@ -273,7 +277,7 @@ function normalizeStructuredRequirements(extracted: StructuredMaxRequirements, r
 
 export type ExistingInteractiveWorkflow = { id: string; version: number; spec: InteractiveWorkflow };
 
-export async function makePlan(instruction: string, existing?: PanelPlan, mode: AgentMode = "mini", existingWorkflow?: ExistingInteractiveWorkflow, availableManagedRoles: string[] = [], availableVoiceChannels: { id: string; name: string; category: string | null }[] = [], availableStaffRoles: { id: string; name: string }[] = []): Promise<PlanResult> {
+export async function makeLegacyPlan(instruction: string, existing?: PanelPlan, mode: AgentMode = "mini", existingWorkflow?: ExistingInteractiveWorkflow, availableManagedRoles: string[] = [], availableVoiceChannels: { id: string; name: string; category: string | null }[] = [], availableStaffRoles: { id: string; name: string }[] = [], _availableChannelIds: string[] = []): Promise<PlanResult> {
   const model = mode === "max"
     ? process.env.AGENTCORD_MAX_MODEL ?? process.env.OPENCODE_MODEL_MAX ?? "river/deepseek-v4.1-flash"
     : process.env.AGENTCORD_MINI_MODEL ?? process.env.OPENCODE_MODEL_MINI ?? "river/deepseek-v4.1-flash";
@@ -500,4 +504,41 @@ Staff-only ticket presetで参照できる既存Guild roles (ID/name、Roleの�
   const plan = panelPlanSchema.parse(result.object);
   if (existing && (plan.intent !== "edit" || plan.panelId !== existing.panelId || plan.expectedRevision !== existing.expectedRevision)) throw new Error("Agentcordが選択中パネルに紐づく編集計画を返しませんでした。");
   return { plan, model: result.response.modelId, inputTokens: result.usage.inputTokens ?? 0, outputTokens: result.usage.outputTokens ?? 0 };
+}
+
+export async function makePlan(instruction: string, existing?: PanelPlan, mode: AgentMode = "mini", existingWorkflow?: ExistingInteractiveWorkflow, availableManagedRoles: string[] = [], availableVoiceChannels: { id: string; name: string; category: string | null }[] = [], availableStaffRoles: { id: string; name: string }[] = [], availableChannelIds: string[] = []): Promise<PlanResult> {
+  const reasonerMode = process.env.AGENTCORD_REASONER_MODE ?? "off";
+  if (mode !== "max" || reasonerMode === "off" || !["shadow", "on"].includes(reasonerMode)) return makeLegacyPlan(instruction, existing, mode, existingWorkflow, availableManagedRoles, availableVoiceChannels, availableStaffRoles, availableChannelIds);
+  const { makeReasonerPlan } = await import("./reasoner/orchestrator.js");
+  const reasoner = () => makeReasonerPlan(instruction, mode, {
+    existingPanel: existing,
+    existingWorkflow: existingWorkflow?.spec,
+    existingWorkflowId: existingWorkflow?.id,
+    existingWorkflowVersion: existingWorkflow?.version,
+    availableManagedRoles,
+    availableVoiceChannels,
+    availableStaffRoles,
+    availableChannelIds,
+  });
+  if (reasonerMode === "on") {
+    return reasoner();
+  }
+  const [legacyResult, reasonerResult] = await Promise.allSettled([
+    makeLegacyPlan(instruction, existing, mode, existingWorkflow, availableManagedRoles, availableVoiceChannels, availableStaffRoles, availableChannelIds),
+    reasoner(),
+  ]);
+  if (legacyResult.status === "rejected") throw legacyResult.reason;
+  const result = legacyResult.value;
+  result.inputTokens += reasonerResult.status === "fulfilled" ? reasonerResult.value.inputTokens : 0;
+  result.outputTokens += reasonerResult.status === "fulfilled" ? reasonerResult.value.outputTokens : 0;
+  const shadowDetails = reasonerResult.status === "fulfilled" ? reasonerResult.value.diagnostics?.reasoner ?? {} : {};
+  const legacyOutcome = result.clarification ? "clarification" : result.interactiveWorkflow ? "interactive" : result.resourceSteps ? "resources" : "panel";
+  const newOutcome = reasonerResult.status === "fulfilled" ? reasonerResult.value.clarification ? "clarification" : reasonerResult.value.interactiveWorkflow ? "interactive" : reasonerResult.value.resourceSteps ? "resources" : "panel" : "error";
+  result.diagnostics = { ...result.diagnostics, shadowReasoner: reasonerResult.status === "fulfilled" ? {
+    engine: "ARE-1.0", reasoningMode: shadowDetails.reasoningMode, failureClass: shadowDetails.failureClass,
+    calls: shadowDetails.calls, repairs: shadowDetails.repairs, elapsedMs: shadowDetails.elapsedMs,
+    coverage: shadowDetails.coverage, unresolved: shadowDetails.unresolved,
+    legacyOutcome, newOutcome, outcomeAgreement: legacyOutcome === newOutcome,
+  } : { failure: reasonerResult.reason instanceof Error ? reasonerResult.reason.message : String(reasonerResult.reason), legacyOutcome } };
+  return result;
 }
